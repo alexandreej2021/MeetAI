@@ -4,7 +4,10 @@
     "channels": 2,
     "chunk_size": 1024,
     "input_device": null,
-    "record_system_audio": true
+    "record_system_audio": true,
+    "mic_gain": 1.0,
+    "system_gain": 0.4,
+    "echo_reduction": true
   },
   "ai": {
     "model": "gpt-3.5-turbo",

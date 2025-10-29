@@ -42,6 +42,14 @@ class AudioRecorder:
         self.mic_timestamps = []
         self.system_timestamps = []
         
+        # Configurações de áudio otimizadas para evitar estouro
+        self.mic_gain = 1.0  # Ganho do microfone (otimizado)
+        self.system_gain = 0.4  # Ganho do sistema (otimizado)
+        self.enable_echo_reduction = True  # Habilitar redução de eco
+        
+        # Carregar configurações salvas se existirem
+        self._load_audio_settings()
+        
     def get_audio_devices(self):
         """Listar dispositivos de áudio disponíveis"""
         devices = []
@@ -81,6 +89,147 @@ class AudioRecorder:
     def set_input_device(self, device_index):
         """Definir dispositivo de entrada específico"""
         self.input_device_index = device_index
+    
+    def set_audio_gains(self, mic_gain=1.2, system_gain=0.5):
+        """Configurar ganhos de áudio para evitar estouro"""
+        self.mic_gain = max(0.1, min(mic_gain, 3.0))  # Limitar entre 0.1 e 3.0
+        self.system_gain = max(0.1, min(system_gain, 2.0))  # Limitar entre 0.1 e 2.0
+        print(f"⚙️  Ganhos configurados: Microfone={self.mic_gain:.1f}x, Sistema={self.system_gain:.1f}x")
+    
+    def set_echo_reduction(self, enabled=True):
+        """Habilitar/desabilitar redução de eco"""
+        self.enable_echo_reduction = enabled
+        print(f"🔊 Redução de eco: {'Habilitada' if enabled else 'Desabilitada'}")
+    
+    def diagnose_audio_issues(self, audio_file=None):
+        """Diagnosticar problemas comuns de áudio"""
+        print("\n🔍 === DIAGNÓSTICO DE ÁUDIO ===")
+        
+        # Verificar configurações atuais
+        print(f"⚙️  Configurações atuais:")
+        print(f"   - Ganho microfone: {self.mic_gain:.1f}x")
+        print(f"   - Ganho sistema: {self.system_gain:.1f}x")
+        print(f"   - Redução de eco: {'Sim' if self.enable_echo_reduction else 'Não'}")
+        print(f"   - Taxa de amostragem: {self.rate}Hz")
+        print(f"   - Canais: {self.channels}")
+        
+        # Verificar dispositivos
+        print(f"\n🎤 Dispositivo atual: {self.input_device_index or 'Padrão do sistema'}")
+        
+        # Recomendações baseadas nos problemas relatados
+        print(f"\n💡 RECOMENDAÇÕES PARA SEU PROBLEMA:")
+        print(f"   📢 MICROFONE ESTOURANDO:")
+        print(f"      - Ganho atual: {self.mic_gain:.1f}x (Bom se < 1.5)")
+        if self.mic_gain > 1.5:
+            print(f"      ⚠️  AÇÃO: Reduzir ganho do microfone")
+            recommended_mic = min(1.0, self.mic_gain * 0.7)
+            print(f"      ✅ Sugestão: {recommended_mic:.1f}x")
+        
+        print(f"\n   🔊 ECO NO ÁUDIO DO SISTEMA:")
+        print(f"      - Redução de eco: {'Ativa' if self.enable_echo_reduction else 'INATIVA'}")
+        print(f"      - Ganho sistema: {self.system_gain:.1f}x")
+        if not self.enable_echo_reduction:
+            print(f"      ⚠️  AÇÃO: Habilitar redução de eco")
+        if self.system_gain > 0.6:
+            print(f"      ⚠️  AÇÃO: Reduzir ganho do sistema")
+            recommended_sys = min(0.4, self.system_gain * 0.8)
+            print(f"      ✅ Sugestão: {recommended_sys:.1f}x")
+        
+        # Análise do arquivo se fornecido
+        if audio_file and os.path.exists(audio_file):
+            try:
+                print(f"\n📁 Analisando arquivo: {audio_file}")
+                with wave.open(audio_file, 'rb') as wf:
+                    frames = wf.readframes(wf.getnframes())
+                    audio_data = np.frombuffer(frames, dtype=np.int16)
+                    
+                    # Estatísticas básicas
+                    max_val = np.max(np.abs(audio_data))
+                    rms = np.sqrt(np.mean(audio_data.astype(np.float32)**2))
+                    
+                    print(f"   - Pico máximo: {max_val}/32767 ({max_val/32767*100:.1f}%)")
+                    print(f"   - RMS médio: {rms:.0f}")
+                    
+                    if max_val > 30000:
+                        print(f"   ⚠️  CLIPPING DETECTADO! Áudio está estourando")
+                    elif max_val < 5000:
+                        print(f"   ⚠️  Áudio muito baixo")
+                    else:
+                        print(f"   ✅ Nível de áudio adequado")
+                        
+            except Exception as e:
+                print(f"   ❌ Erro ao analisar arquivo: {e}")
+        
+        print(f"\n🔧 COMANDOS PARA CORRIGIR:")
+        print(f"   recorder.set_audio_gains({min(1.0, self.mic_gain*0.8):.1f}, {min(0.4, self.system_gain*0.8):.1f})")
+        print(f"   recorder.set_echo_reduction(True)")
+        print(f"=== FIM DO DIAGNÓSTICO ===\n")
+    
+    def _load_audio_settings(self):
+        """Carregar configurações de áudio salvas"""
+        try:
+            import json
+            from pathlib import Path
+            
+            settings_file = Path("config/settings.json")
+            if settings_file.exists():
+                with open(settings_file, 'r') as f:
+                    settings = json.load(f)
+                
+                # Carregar configurações de áudio
+                audio_config = settings.get('audio', {})
+                
+                # Aplicar configurações se existirem
+                if 'mic_gain' in audio_config:
+                    self.mic_gain = max(0.1, min(audio_config['mic_gain'], 3.0))
+                
+                if 'system_gain' in audio_config:
+                    self.system_gain = max(0.1, min(audio_config['system_gain'], 2.0))
+                
+                if 'echo_reduction' in audio_config:
+                    self.enable_echo_reduction = audio_config['echo_reduction']
+                
+                print(f"⚙️  Configurações de áudio carregadas: Mic={self.mic_gain:.1f}x, Sistema={self.system_gain:.1f}x, Eco={'On' if self.enable_echo_reduction else 'Off'}")
+                
+        except Exception as e:
+            print(f"⚠️  Erro ao carregar configurações de áudio: {e}")
+    
+    def save_audio_settings(self):
+        """Salvar configurações de áudio atuais"""
+        try:
+            import json
+            from pathlib import Path
+            
+            # Criar diretório se não existir
+            config_dir = Path("config")
+            config_dir.mkdir(exist_ok=True)
+            
+            settings_file = config_dir / "settings.json"
+            
+            # Carregar configurações existentes ou criar novas
+            if settings_file.exists():
+                with open(settings_file, 'r') as f:
+                    settings = json.load(f)
+            else:
+                settings = {}
+            
+            # Garantir que existe seção de áudio
+            if 'audio' not in settings:
+                settings['audio'] = {}
+            
+            # Atualizar configurações de áudio
+            settings['audio']['mic_gain'] = self.mic_gain
+            settings['audio']['system_gain'] = self.system_gain
+            settings['audio']['echo_reduction'] = self.enable_echo_reduction
+            
+            # Salvar arquivo
+            with open(settings_file, 'w') as f:
+                json.dump(settings, f, indent=2)
+            
+            print(f"💾 Configurações de áudio salvas!")
+            
+        except Exception as e:
+            print(f"❌ Erro ao salvar configurações: {e}")
     
     def set_realtime_transcription_callback(self, callback):
         """Definir callback para transcrição em tempo real"""
@@ -521,9 +670,9 @@ class AudioRecorder:
                     mic_stereo = np.column_stack((mic_array, mic_array)).flatten()
                 else:
                     mic_stereo = mic_array
-                # Amplificar microfone significativamente mais
-                mic_stereo = self._amplify_audio(mic_stereo, 3.0)
-                print(f"🔊 Microfone amplificado: 3.0x")
+                # Amplificar microfone usando configuração
+                mic_stereo = self._amplify_audio(mic_stereo, self.mic_gain)
+                print(f"🔊 Microfone amplificado: {self.mic_gain:.1f}x")
                 return mic_stereo.tobytes()
             
             # Se só tem áudio do sistema
@@ -560,10 +709,14 @@ class AudioRecorder:
             mic_normalized = self._normalize_audio(mic_array)
             system_normalized = self._normalize_audio(system_array)
             
-            # Mixar com volumes otimizados - MICROFONE MUITO MAIS ALTO
-            mixed = (mic_normalized * 2.5 + system_normalized * 0.7).astype(np.int16)
+            # Aplicar redução de eco no áudio do sistema se habilitado
+            if self.enable_echo_reduction:
+                system_normalized = self._reduce_echo(system_normalized)
             
-            print(f"🔊 Volumes aplicados: Microfone=2.5x, Sistema=0.7x")
+            # Mixar com volumes configuráveis - CORREÇÃO PARA EVITAR ESTOURO
+            mixed = (mic_normalized * self.mic_gain + system_normalized * self.system_gain).astype(np.int16)
+            
+            print(f"🔊 Volumes aplicados: Microfone={self.mic_gain:.1f}x, Sistema={self.system_gain:.1f}x")
             
             # Prevenir clipping
             mixed = np.clip(mixed, -32767, 32767)
@@ -590,7 +743,7 @@ class AudioRecorder:
             return audio_array
     
     def _normalize_audio(self, audio_array):
-        """Normalizar áudio para usar toda a faixa dinâmica"""
+        """Normalizar áudio para usar toda a faixa dinâmica sem estouro"""
         try:
             if len(audio_array) == 0:
                 return audio_array
@@ -599,19 +752,54 @@ class AudioRecorder:
             rms = np.sqrt(np.mean(audio_array.astype(np.float32)**2))
             
             if rms > 0:
-                # Normalizar para ~70% da faixa máxima
-                target_rms = 32767 * 0.7
+                # Normalizar para ~50% da faixa máxima (mais conservador)
+                target_rms = 32767 * 0.5
                 factor = target_rms / rms
-                # Limitar amplificação máxima
-                factor = min(factor, 3.0)
+                # Limitar amplificação máxima para evitar estouro
+                factor = min(factor, 2.0)
                 normalized = audio_array * factor
                 return np.clip(normalized, -32767, 32767).astype(np.int16)
             
             return audio_array
             
+        except:
+            return audio_array
+    
+    def _reduce_echo(self, system_audio):
+        """Reduzir eco no áudio do sistema"""
+        try:
+            if len(system_audio) == 0:
+                return system_audio
+            
+            # Aplicar filtro de redução de eco simples
+            # Reduzir frequências que causam eco (normalmente baixas e médias)
+            audio_float = system_audio.astype(np.float32)
+            
+            # Aplicar compressão dinâmica suave
+            max_val = np.max(np.abs(audio_float))
+            if max_val > 16000:  # Se muito alto
+                compression_ratio = 16000 / max_val
+                audio_float *= compression_ratio
+            
+            # Reduzir reverberação aplicando um filtro passa-alta leve
+            if len(audio_float) > 10:
+                # Filtro simples: reduzir componentes de baixa frequência
+                filtered = audio_float.copy()
+                for i in range(5, len(filtered)-5):
+                    # Média móvel invertida para reduzir eco
+                    filtered[i] = audio_float[i] * 0.8 + np.mean(audio_float[i-2:i+2]) * 0.2
+                
+                return np.clip(filtered, -32767, 32767).astype(np.int16)
+            
+            return np.clip(audio_float, -32767, 32767).astype(np.int16)
+            
+        except Exception as e:
+            print(f"Erro na redução de eco: {e}")
+            return system_audio
+            
         except Exception as e:
             print(f"Erro na normalização: {e}")
-            return audio_array
+            return system_audio
     
     def _resample_if_needed(self, audio_array, from_rate, to_rate):
         """Resample áudio se as taxas forem diferentes"""
@@ -848,9 +1036,9 @@ class AudioRecorder:
             mic_array = mic_array[:min_length]
             system_array = system_array[:min_length]
             
-            # Mixagem simples com amplificação otimizada
-            mic_amplified = self._amplify_audio(mic_array, 2.5)
-            system_amplified = self._amplify_audio(system_array, 0.7)
+            # Mixagem simples com amplificação configurável
+            mic_amplified = self._amplify_audio(mic_array, self.mic_gain)
+            system_amplified = self._amplify_audio(system_array, self.system_gain)
             
             # Combinação sem overflow checking para velocidade
             mixed = (mic_amplified.astype(np.int32) + system_amplified.astype(np.int32))
