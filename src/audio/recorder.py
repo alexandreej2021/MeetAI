@@ -44,8 +44,9 @@ class AudioRecorder:
         
         # Configurações de áudio otimizadas para evitar estouro
         self.mic_gain = 1.0  # Ganho do microfone (otimizado)
-        self.system_gain = 0.4  # Ganho do sistema (otimizado)
+        self.system_gain = 0.3  # Ganho do sistema (reduzido para menos eco)
         self.enable_echo_reduction = True  # Habilitar redução de eco
+        self.echo_reduction_strength = "aggressive"  # normal, aggressive, extreme
         
         # Carregar configurações salvas se existirem
         self._load_audio_settings()
@@ -96,10 +97,36 @@ class AudioRecorder:
         self.system_gain = max(0.1, min(system_gain, 2.0))  # Limitar entre 0.1 e 2.0
         print(f"⚙️  Ganhos configurados: Microfone={self.mic_gain:.1f}x, Sistema={self.system_gain:.1f}x")
     
-    def set_echo_reduction(self, enabled=True):
-        """Habilitar/desabilitar redução de eco"""
+    def set_echo_reduction(self, enabled=True, strength="aggressive"):
+        """Habilitar/desabilitar redução de eco com diferentes intensidades"""
         self.enable_echo_reduction = enabled
-        print(f"🔊 Redução de eco: {'Habilitada' if enabled else 'Desabilitada'}")
+        self.echo_reduction_strength = strength
+        print(f"🔊 Redução de eco: {'Habilitada' if enabled else 'Desabilitada'} ({strength})")
+    
+    def set_microphone_only_mode(self, enabled=True):
+        """Modo apenas microfone (sem áudio do sistema) para eliminar eco completamente"""
+        self.record_system_audio = not enabled
+        if enabled:
+            print("🎤 Modo apenas microfone ativado - Eco eliminado, mas sem áudio do sistema")
+        else:
+            print("🔊 Modo mixado reativado - Microfone + áudio do sistema")
+    
+    def quick_echo_fix(self):
+        """Aplicar correção rápida para problemas severos de eco"""
+        print("🚨 === CORREÇÃO RÁPIDA DE ECO ===")
+        
+        # Configurações mais agressivas
+        self.set_audio_gains(0.9, 0.2)  # Microfone um pouco menor, sistema muito menor
+        self.set_echo_reduction(True, "extreme")  # Modo extremo
+        
+        print("✅ Configurações extremas aplicadas:")
+        print("   - Microfone: 0.9x (reduzido)")
+        print("   - Sistema: 0.2x (muito reduzido)")
+        print("   - Redução de eco: EXTREMA")
+        print("\n🎯 Se o eco persistir, use: recorder.set_microphone_only_mode(True)")
+        
+        # Salvar automaticamente
+        self.save_audio_settings()
     
     def diagnose_audio_issues(self, audio_file=None):
         """Diagnosticar problemas comuns de áudio"""
@@ -189,7 +216,10 @@ class AudioRecorder:
                 if 'echo_reduction' in audio_config:
                     self.enable_echo_reduction = audio_config['echo_reduction']
                 
-                print(f"⚙️  Configurações de áudio carregadas: Mic={self.mic_gain:.1f}x, Sistema={self.system_gain:.1f}x, Eco={'On' if self.enable_echo_reduction else 'Off'}")
+                if 'echo_reduction_strength' in audio_config:
+                    self.echo_reduction_strength = audio_config['echo_reduction_strength']
+                
+                print(f"⚙️  Configurações de áudio carregadas: Mic={self.mic_gain:.1f}x, Sistema={self.system_gain:.1f}x, Eco={'On' if self.enable_echo_reduction else 'Off'}({self.echo_reduction_strength})")
                 
         except Exception as e:
             print(f"⚠️  Erro ao carregar configurações de áudio: {e}")
@@ -221,6 +251,7 @@ class AudioRecorder:
             settings['audio']['mic_gain'] = self.mic_gain
             settings['audio']['system_gain'] = self.system_gain
             settings['audio']['echo_reduction'] = self.enable_echo_reduction
+            settings['audio']['echo_reduction_strength'] = self.echo_reduction_strength
             
             # Salvar arquivo
             with open(settings_file, 'w') as f:
@@ -766,35 +797,111 @@ class AudioRecorder:
             return audio_array
     
     def _reduce_echo(self, system_audio):
-        """Reduzir eco no áudio do sistema"""
+        """Redução avançada de eco no áudio do sistema"""
         try:
             if len(system_audio) == 0:
                 return system_audio
             
-            # Aplicar filtro de redução de eco simples
-            # Reduzir frequências que causam eco (normalmente baixas e médias)
             audio_float = system_audio.astype(np.float32)
             
-            # Aplicar compressão dinâmica suave
+            # 1. COMPRESSÃO DINÂMICA BASEADA NA INTENSIDADE
             max_val = np.max(np.abs(audio_float))
-            if max_val > 16000:  # Se muito alto
-                compression_ratio = 16000 / max_val
-                audio_float *= compression_ratio
             
-            # Reduzir reverberação aplicando um filtro passa-alta leve
-            if len(audio_float) > 10:
-                # Filtro simples: reduzir componentes de baixa frequência
-                filtered = audio_float.copy()
-                for i in range(5, len(filtered)-5):
-                    # Média móvel invertida para reduzir eco
-                    filtered[i] = audio_float[i] * 0.8 + np.mean(audio_float[i-2:i+2]) * 0.2
+            # Ajustar limiar baseado na intensidade
+            if self.echo_reduction_strength == "extreme":
+                threshold = 8000
+                reduction_factor = 0.25  # Muito agressivo
+            elif self.echo_reduction_strength == "aggressive":
+                threshold = 10000
+                reduction_factor = 0.3  # Agressivo (padrão para seu caso)
+            else:  # normal
+                threshold = 15000
+                reduction_factor = 0.4  # Suave
                 
-                return np.clip(filtered, -32767, 32767).astype(np.int16)
+            if max_val > threshold:
+                compression_ratio = threshold / max_val
+                audio_float *= compression_ratio
+                print(f"🔧 Compressão {self.echo_reduction_strength}: {compression_ratio:.2f}")
+            
+            # 2. FILTRO PASSA-ALTA PARA REMOVER FREQUÊNCIAS BAIXAS (eco)
+            if len(audio_float) > 20:
+                # Filtro passa-alta simples - remove frequências baixas que causam eco
+                filtered = np.zeros_like(audio_float)
+                alpha = 0.95  # Coeficiente do filtro passa-alta
+                
+                filtered[0] = audio_float[0]
+                for i in range(1, len(audio_float)):
+                    filtered[i] = alpha * (filtered[i-1] + audio_float[i] - audio_float[i-1])
+                
+                audio_float = filtered
+            
+            # 3. REDUÇÃO DE REVERBERAÇÃO COM JANELA ADAPTATIVA
+            if len(audio_float) > 100:
+                window_size = min(50, len(audio_float) // 10)
+                smoothed = np.zeros_like(audio_float)
+                
+                for i in range(len(audio_float)):
+                    start = max(0, i - window_size)
+                    end = min(len(audio_float), i + window_size)
+                    
+                    # Média ponderada que reduz ecos
+                    window = audio_float[start:end]
+                    # Dar mais peso ao centro, menos às bordas (reduz eco)
+                    weights = np.ones(len(window))
+                    center = len(window) // 2
+                    
+                    for j in range(len(weights)):
+                        distance = abs(j - center)
+                        weights[j] = max(0.3, 1.0 - distance * 0.1)
+                    
+                    # Aplicar redução baseada na intensidade
+                    if self.echo_reduction_strength == "extreme":
+                        smoothed[i] = np.average(window, weights=weights) * 0.3 + audio_float[i] * 0.7
+                    elif self.echo_reduction_strength == "aggressive":
+                        smoothed[i] = np.average(window, weights=weights) * 0.5 + audio_float[i] * 0.5
+                    else:  # normal
+                        smoothed[i] = np.average(window, weights=weights) * 0.6 + audio_float[i] * 0.4
+                
+                audio_float = smoothed
+            
+            # 4. PROCESSAMENTO ESTÉREO PARA REDUZIR CORRELAÇÃO
+            if len(audio_float) % 2 == 0:  # Se é estéreo
+                left = audio_float[0::2]
+                right = audio_float[1::2]
+                
+                # Reduzir correlação entre canais
+                if len(left) > 10:
+                    # Aplicar pequeno atraso no canal direito
+                    right_delayed = np.roll(right, 2)
+                    right_delayed[:2] = right[:2]  # Manter início
+                    
+                    # Reduzir amplitude do canal mais forte
+                    left_rms = np.sqrt(np.mean(left**2))
+                    right_rms = np.sqrt(np.mean(right_delayed**2))
+                    
+                    if left_rms > right_rms * 1.2:
+                        left *= 0.85  # Reduzir canal esquerdo
+                    elif right_rms > left_rms * 1.2:
+                        right_delayed *= 0.85  # Reduzir canal direito
+                    
+                    # Recombinar canais
+                    result = np.zeros_like(audio_float)
+                    result[0::2] = left
+                    result[1::2] = right_delayed
+                    audio_float = result
+            
+            # 5. NORMALIZAÇÃO FINAL CONSERVADORA
+            max_final = np.max(np.abs(audio_float))
+            if max_final > 0:
+                # Normalizar para 60% da faixa dinâmica
+                target = 32767 * 0.6
+                if max_final > target:
+                    audio_float *= (target / max_final)
             
             return np.clip(audio_float, -32767, 32767).astype(np.int16)
             
         except Exception as e:
-            print(f"Erro na redução de eco: {e}")
+            print(f"Erro na redução avançada de eco: {e}")
             return system_audio
             
         except Exception as e:
