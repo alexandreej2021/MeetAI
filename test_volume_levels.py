@@ -26,8 +26,8 @@ def test_volume_levels():
         if recorder.start_recording():
             print("✅ Gravação iniciada - monitorando volumes...")
             
-            # Gravar por 10 segundos com monitoramento
-            for i in range(10):
+            # Gravar por 120 segundos com monitoramento
+            for i in range(20):
                 time.sleep(1)
                 print(f"⏱️  {i+1}s...", end="")
                 

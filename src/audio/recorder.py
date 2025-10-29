@@ -1,1183 +1,859 @@
-"""
-Módulo de gravação de áudio
-Grava áudio do sistema e microfone simultaneamente
-"""
+# -*- coding: utf-8 -*-
+"""Stack de captura e processamento de áudio do MeetAI."""
 
-import pyaudio
-import wave
+from __future__ import annotations
+
+import json
 import threading
 import time
+import wave
+from collections import deque
 from datetime import datetime
-import os
+from pathlib import Path
+from typing import Callable, Deque, List, Optional, Tuple
+
 import numpy as np
 import sounddevice as sd
 
-class AudioRecorder:
-    def __init__(self):
-        self.chunk = 512  # Reduzido para menor latência (era 1024)
-        self.format = pyaudio.paInt16
-        self.channels = 2  # Tenta 2 canais, mas ajusta se necessário
-        self.rate = 44100
-        self.recording = False
-        self.frames = []
-        self.audio = pyaudio.PyAudio()
-        self.stream = None
-        self.input_device_index = None  # Device específico ou None para padrão
-        
-        # Para gravação de áudio do sistema
-        self.system_audio_frames = []
-        self.mic_frames = []
-        self.system_stream = None
-        self.mic_stream = None
-        
-        # Transcrição em tempo real DESABILITADA (por preferência do usuário)
-        self.realtime_callback = None
-        self.temp_dir = "temp"
-        os.makedirs(self.temp_dir, exist_ok=True)
-        self.system_recording_thread = None
-        self.record_system_audio = True  # Flag para incluir áudio do sistema
-        
-        # Para sincronização
-        self.recording_start_time = None
-        self.mic_timestamps = []
-        self.system_timestamps = []
-        
-        # Configurações de áudio otimizadas para evitar estouro
-        self.mic_gain = 1.0  # Ganho do microfone (otimizado)
-        self.system_gain = 0.3  # Ganho do sistema (reduzido para menos eco)
-        self.enable_echo_reduction = True  # Habilitar redução de eco
-        self.echo_reduction_strength = "aggressive"  # normal, aggressive, extreme
-        
-        # Carregar configurações salvas se existirem
-        self._load_audio_settings()
-        
-    def get_audio_devices(self):
-        """Listar dispositivos de áudio disponíveis"""
-        devices = []
-        for i in range(self.audio.get_device_count()):
-            device_info = self.audio.get_device_info_by_index(i)
-            # Só listar dispositivos que suportam entrada (microfones)
-            if device_info['maxInputChannels'] > 0:
-                devices.append({
-                    'index': i,
-                    'name': device_info['name'],
-                    'channels': device_info['maxInputChannels'],
-                    'default_sample_rate': device_info.get('defaultSampleRate', 44100)
-                })
-        return devices
-    
-    def get_system_audio_devices(self):
-        """Listar dispositivos de saída (para capturar áudio do sistema)"""
-        devices = []
-        try:
-            # Usar sounddevice para listar dispositivos
-            sd_devices = sd.query_devices()
-            for i, device_info in enumerate(sd_devices):
-                # Procurar por dispositivos de saída que podem ser usados como entrada (loopback)
-                if device_info['max_output_channels'] > 0:
-                    # Adicionar dispositivos que suportam WASAPI loopback
-                    if 'WASAPI' in str(device_info) or 'Speakers' in device_info['name'] or 'Alto-falantes' in device_info['name']:
-                        devices.append({
-                            'index': i,
-                            'name': device_info['name'],
-                            'channels': device_info['max_output_channels'],
-                            'sample_rate': device_info['default_samplerate']
-                        })
-        except Exception as e:
-            print(f"Erro ao listar dispositivos de sistema: {e}")
-        return devices
-    
-    def set_input_device(self, device_index):
-        """Definir dispositivo de entrada específico"""
-        self.input_device_index = device_index
-    
-    def set_audio_gains(self, mic_gain=1.2, system_gain=0.5):
-        """Configurar ganhos de áudio para evitar estouro"""
-        self.mic_gain = max(0.1, min(mic_gain, 3.0))  # Limitar entre 0.1 e 3.0
-        self.system_gain = max(0.1, min(system_gain, 2.0))  # Limitar entre 0.1 e 2.0
-        print(f"⚙️  Ganhos configurados: Microfone={self.mic_gain:.1f}x, Sistema={self.system_gain:.1f}x")
-    
-    def set_echo_reduction(self, enabled=True, strength="aggressive"):
-        """Habilitar/desabilitar redução de eco com diferentes intensidades"""
-        self.enable_echo_reduction = enabled
-        self.echo_reduction_strength = strength
-        print(f"🔊 Redução de eco: {'Habilitada' if enabled else 'Desabilitada'} ({strength})")
-    
-    def set_microphone_only_mode(self, enabled=True):
-        """Modo apenas microfone (sem áudio do sistema) para eliminar eco completamente"""
-        self.record_system_audio = not enabled
-        if enabled:
-            print("🎤 Modo apenas microfone ativado - Eco eliminado, mas sem áudio do sistema")
-        else:
-            print("🔊 Modo mixado reativado - Microfone + áudio do sistema")
-    
-    def quick_echo_fix(self):
-        """Aplicar correção rápida para problemas severos de eco"""
-        print("🚨 === CORREÇÃO RÁPIDA DE ECO ===")
-        
-        # Configurações mais agressivas
-        self.set_audio_gains(0.9, 0.2)  # Microfone um pouco menor, sistema muito menor
-        self.set_echo_reduction(True, "extreme")  # Modo extremo
-        
-        print("✅ Configurações extremas aplicadas:")
-        print("   - Microfone: 0.9x (reduzido)")
-        print("   - Sistema: 0.2x (muito reduzido)")
-        print("   - Redução de eco: EXTREMA")
-        print("\n🎯 Se o eco persistir, use: recorder.set_microphone_only_mode(True)")
-        
-        # Salvar automaticamente
-        self.save_audio_settings()
-    
-    def diagnose_audio_issues(self, audio_file=None):
-        """Diagnosticar problemas comuns de áudio"""
-        print("\n🔍 === DIAGNÓSTICO DE ÁUDIO ===")
-        
-        # Verificar configurações atuais
-        print(f"⚙️  Configurações atuais:")
-        print(f"   - Ganho microfone: {self.mic_gain:.1f}x")
-        print(f"   - Ganho sistema: {self.system_gain:.1f}x")
-        print(f"   - Redução de eco: {'Sim' if self.enable_echo_reduction else 'Não'}")
-        print(f"   - Taxa de amostragem: {self.rate}Hz")
-        print(f"   - Canais: {self.channels}")
-        
-        # Verificar dispositivos
-        print(f"\n🎤 Dispositivo atual: {self.input_device_index or 'Padrão do sistema'}")
-        
-        # Recomendações baseadas nos problemas relatados
-        print(f"\n💡 RECOMENDAÇÕES PARA SEU PROBLEMA:")
-        print(f"   📢 MICROFONE ESTOURANDO:")
-        print(f"      - Ganho atual: {self.mic_gain:.1f}x (Bom se < 1.5)")
-        if self.mic_gain > 1.5:
-            print(f"      ⚠️  AÇÃO: Reduzir ganho do microfone")
-            recommended_mic = min(1.0, self.mic_gain * 0.7)
-            print(f"      ✅ Sugestão: {recommended_mic:.1f}x")
-        
-        print(f"\n   🔊 ECO NO ÁUDIO DO SISTEMA:")
-        print(f"      - Redução de eco: {'Ativa' if self.enable_echo_reduction else 'INATIVA'}")
-        print(f"      - Ganho sistema: {self.system_gain:.1f}x")
-        if not self.enable_echo_reduction:
-            print(f"      ⚠️  AÇÃO: Habilitar redução de eco")
-        if self.system_gain > 0.6:
-            print(f"      ⚠️  AÇÃO: Reduzir ganho do sistema")
-            recommended_sys = min(0.4, self.system_gain * 0.8)
-            print(f"      ✅ Sugestão: {recommended_sys:.1f}x")
-        
-        # Análise do arquivo se fornecido
-        if audio_file and os.path.exists(audio_file):
-            try:
-                print(f"\n📁 Analisando arquivo: {audio_file}")
-                with wave.open(audio_file, 'rb') as wf:
-                    frames = wf.readframes(wf.getnframes())
-                    audio_data = np.frombuffer(frames, dtype=np.int16)
-                    
-                    # Estatísticas básicas
-                    max_val = np.max(np.abs(audio_data))
-                    rms = np.sqrt(np.mean(audio_data.astype(np.float32)**2))
-                    
-                    print(f"   - Pico máximo: {max_val}/32767 ({max_val/32767*100:.1f}%)")
-                    print(f"   - RMS médio: {rms:.0f}")
-                    
-                    if max_val > 30000:
-                        print(f"   ⚠️  CLIPPING DETECTADO! Áudio está estourando")
-                    elif max_val < 5000:
-                        print(f"   ⚠️  Áudio muito baixo")
-                    else:
-                        print(f"   ✅ Nível de áudio adequado")
-                        
-            except Exception as e:
-                print(f"   ❌ Erro ao analisar arquivo: {e}")
-        
-        print(f"\n🔧 COMANDOS PARA CORRIGIR:")
-        print(f"   recorder.set_audio_gains({min(1.0, self.mic_gain*0.8):.1f}, {min(0.4, self.system_gain*0.8):.1f})")
-        print(f"   recorder.set_echo_reduction(True)")
-        print(f"=== FIM DO DIAGNÓSTICO ===\n")
-    
-    def _load_audio_settings(self):
-        """Carregar configurações de áudio salvas"""
-        try:
-            import json
-            from pathlib import Path
-            
-            settings_file = Path("config/settings.json")
-            if settings_file.exists():
-                with open(settings_file, 'r') as f:
-                    settings = json.load(f)
-                
-                # Carregar configurações de áudio
-                audio_config = settings.get('audio', {})
-                
-                # Aplicar configurações se existirem
-                if 'mic_gain' in audio_config:
-                    self.mic_gain = max(0.1, min(audio_config['mic_gain'], 3.0))
-                
-                if 'system_gain' in audio_config:
-                    self.system_gain = max(0.1, min(audio_config['system_gain'], 2.0))
-                
-                if 'echo_reduction' in audio_config:
-                    self.enable_echo_reduction = audio_config['echo_reduction']
-                
-                if 'echo_reduction_strength' in audio_config:
-                    self.echo_reduction_strength = audio_config['echo_reduction_strength']
-                
-                print(f"⚙️  Configurações de áudio carregadas: Mic={self.mic_gain:.1f}x, Sistema={self.system_gain:.1f}x, Eco={'On' if self.enable_echo_reduction else 'Off'}({self.echo_reduction_strength})")
-                
-        except Exception as e:
-            print(f"⚠️  Erro ao carregar configurações de áudio: {e}")
-    
-    def save_audio_settings(self):
-        """Salvar configurações de áudio atuais"""
-        try:
-            import json
-            from pathlib import Path
-            
-            # Criar diretório se não existir
-            config_dir = Path("config")
-            config_dir.mkdir(exist_ok=True)
-            
-            settings_file = config_dir / "settings.json"
-            
-            # Carregar configurações existentes ou criar novas
-            if settings_file.exists():
-                with open(settings_file, 'r') as f:
-                    settings = json.load(f)
+RealtimeCallback = Callable[[str, int], None]
+
+SYSTEM_KEYWORDS = [
+    "stereo mix",
+    "mixagem",
+    "loopback",
+    "what u hear",
+    "wave out mix",
+    "sum",
+    "alto-falantes (loopback)",
+]
+
+
+class AudioProcessor:
+    """Coleção de utilidades para tratamento de áudio em int16."""
+
+    @staticmethod
+    def db_to_linear(db_value: float) -> float:
+        return 10.0 ** (db_value / 20.0)
+
+    @staticmethod
+    def linear_to_db(linear_gain: float) -> float:
+        if linear_gain <= 0:
+            return -80.0
+        return 20.0 * np.log10(linear_gain)
+
+    @staticmethod
+    def safe_clip(audio: np.ndarray) -> np.ndarray:
+        return np.clip(audio, -32768, 32767).astype(np.int16, copy=False)
+
+    @staticmethod
+    def apply_gain(audio: np.ndarray, gain_db: float) -> np.ndarray:
+        if audio.size == 0 or gain_db == 0.0:
+            return audio
+        gain = AudioProcessor.db_to_linear(gain_db)
+        amplified = audio.astype(np.float64) * gain
+        return AudioProcessor.safe_clip(amplified)
+
+    @staticmethod
+    def high_pass_filter(audio: np.ndarray, sample_rate: int, cutoff: float = 80.0) -> np.ndarray:
+        if audio.size < 2:
+            return audio
+
+        rc = 1.0 / (2 * np.pi * cutoff)
+        dt = 1.0 / sample_rate
+        alpha = rc / (rc + dt)
+
+        filtered = np.zeros_like(audio, dtype=np.float64)
+        filtered[0] = audio[0]
+        for idx in range(1, len(audio)):
+            filtered[idx] = alpha * (filtered[idx - 1] + audio[idx] - audio[idx - 1])
+        return AudioProcessor.safe_clip(filtered)
+
+    @staticmethod
+    def apply_noise_gate(
+        audio: np.ndarray,
+        sample_rate: int,
+        threshold_db: float = -65.0,
+        attack_ms: float = 6.0,
+        release_ms: float = 200.0,
+        hold_ms: float = 250.0,
+        floor: float = 0.3,
+    ) -> np.ndarray:
+        if audio.size == 0:
+            return audio
+
+        threshold = 32767.0 * (10.0 ** (threshold_db / 20.0))
+        window = max(1, int(sample_rate * 0.01))
+
+        squares = audio.astype(np.float64) ** 2
+        kernel = np.ones(window)
+        moving_rms = np.sqrt(np.convolve(squares, kernel, "same") / window)
+
+        attack_samples = max(1, int(attack_ms * sample_rate / 1000))
+        release_samples = max(1, int(release_ms * sample_rate / 1000))
+        hold_samples = max(1, int(hold_ms * sample_rate / 1000))
+        gate_state = floor
+        hold_counter = 0
+        output = np.zeros_like(audio, dtype=np.float64)
+
+        for idx, sample in enumerate(audio.astype(np.float64)):
+            if moving_rms[idx] >= threshold:
+                gate_state += (1.0 - gate_state) / attack_samples
+                hold_counter = hold_samples
             else:
-                settings = {}
-            
-            # Garantir que existe seção de áudio
-            if 'audio' not in settings:
-                settings['audio'] = {}
-            
-            # Atualizar configurações de áudio
-            settings['audio']['mic_gain'] = self.mic_gain
-            settings['audio']['system_gain'] = self.system_gain
-            settings['audio']['echo_reduction'] = self.enable_echo_reduction
-            settings['audio']['echo_reduction_strength'] = self.echo_reduction_strength
-            
-            # Salvar arquivo
-            with open(settings_file, 'w') as f:
-                json.dump(settings, f, indent=2)
-            
-            print(f"💾 Configurações de áudio salvas!")
-            
-        except Exception as e:
-            print(f"❌ Erro ao salvar configurações: {e}")
-    
-    def set_realtime_transcription_callback(self, callback):
-        """Definir callback para transcrição em tempo real"""
+                if hold_counter > 0:
+                    hold_counter -= 1
+                else:
+                    gate_state -= (gate_state - floor) / release_samples
+
+            gate_state = np.clip(gate_state, floor, 1.0)
+            output[idx] = sample * gate_state
+
+        return AudioProcessor.safe_clip(output)
+
+    @staticmethod
+    def apply_compressor(
+        audio: np.ndarray,
+        threshold_db: float = -16.0,
+        ratio: float = 3.5,
+        makeup_gain_db: float = 1.5,
+    ) -> np.ndarray:
+        if audio.size == 0:
+            return audio
+
+        audio_float = audio.astype(np.float64)
+        threshold = 32767.0 * (10.0 ** (threshold_db / 20.0))
+
+        magnitude = np.abs(audio_float)
+        over_threshold = magnitude > threshold
+        if np.any(over_threshold):
+            excess = magnitude[over_threshold] - threshold
+            compressed = threshold + (excess / ratio)
+            audio_float[over_threshold] = np.sign(audio_float[over_threshold]) * compressed
+
+        audio_float *= AudioProcessor.db_to_linear(makeup_gain_db)
+        return AudioProcessor.safe_clip(audio_float)
+
+    @staticmethod
+    def normalize(audio: np.ndarray, target_db: float = -14.0) -> np.ndarray:
+        if audio.size == 0:
+            return audio
+
+        rms = np.sqrt(np.mean(audio.astype(np.float64) ** 2))
+        if rms < 1e-6:
+            return audio
+
+        target = 32767.0 * (10.0 ** (target_db / 20.0))
+        gain = target / rms
+        gain = min(gain, 5.0)
+        normalized = audio.astype(np.float64) * gain
+        return AudioProcessor.safe_clip(normalized)
+
+    @staticmethod
+    def reduce_echo(
+        system_audio: np.ndarray,
+        mic_audio: np.ndarray,
+        sample_rate: int,
+        strength: float = 0.55,
+    ) -> np.ndarray:
+        if system_audio.size == 0 or mic_audio.size == 0:
+            return system_audio
+
+        length = min(system_audio.size, mic_audio.size)
+        system = system_audio[:length].astype(np.float64)
+        mic = mic_audio[:length].astype(np.float64)
+
+        window = min(int(sample_rate * 0.05), length)
+        if window < 32:
+            return system_audio
+
+        sys_window = system[:window]
+        mic_window = mic[:window]
+
+        denominator = (np.linalg.norm(sys_window) * np.linalg.norm(mic_window)) + 1e-9
+        correlation = np.dot(sys_window, mic_window) / denominator
+        correlation = np.clip(correlation, -1.0, 1.0)
+
+        if abs(correlation) < 0.1:
+            return system_audio
+
+        effective_strength = np.clip(abs(correlation) * strength, 0.0, 0.8)
+        echo_estimate = mic * effective_strength
+        cleaned = system - echo_estimate
+        return AudioProcessor.safe_clip(cleaned).astype(np.int16)
+
+    @staticmethod
+    def mix_tracks(mic_audio: np.ndarray, system_audio: np.ndarray) -> np.ndarray:
+        if mic_audio.size == 0 and system_audio.size == 0:
+            return np.array([], dtype=np.int16)
+
+        if mic_audio.size == 0:
+            return system_audio
+        if system_audio.size == 0:
+            return mic_audio
+
+        length = min(mic_audio.size, system_audio.size)
+        mixed = mic_audio[:length].astype(np.int32) + system_audio[:length].astype(np.int32)
+        return AudioProcessor.safe_clip(mixed)
+
+    @staticmethod
+    def analyze_levels(audio: np.ndarray) -> Tuple[float, float]:
+        if audio.size == 0:
+            return -np.inf, -np.inf
+
+        audio_float = audio.astype(np.float64)
+        peak = np.max(np.abs(audio_float))
+        rms = np.sqrt(np.mean(audio_float ** 2))
+
+        peak_db = -np.inf if peak == 0 else 20.0 * np.log10(peak / 32767.0)
+        rms_db = -np.inf if rms == 0 else 20.0 * np.log10(rms / 32767.0)
+        return peak_db, rms_db
+
+
+class AudioRecorder:
+    """Gravador de áudio completo com processamento e streaming em tempo real."""
+
+    def __init__(self):
+        # Parâmetros básicos
+        self.sample_rate = 44100
+        self.channels = 2
+        self.dtype = np.int16
+        self.chunk = 1024
+
+        # Configuração de chunking
+        self.chunk_duration = 8
+        self.chunk_overlap = 2
+
+        # Flags e callbacks
+        self.record_system_audio = True
+        self.realtime_callback: Optional[RealtimeCallback] = None
+
+        # Processamento
+        self.processor = AudioProcessor()
+        self.config = {
+            "mic_gain_db": 7.5,
+            "system_gain_db": 5.0,
+            "enable_echo_reduction": True,
+            "echo_strength": 0.55,
+            "enable_noise_gate": True,
+            "noise_gate_threshold_db": -65.0,
+            "noise_gate_hold_ms": 250.0,
+            "noise_gate_floor": 0.3,
+            "enable_compressor": True,
+            "compressor_threshold_db": -16.0,
+            "compressor_ratio": 3.5,
+            "normalize_target_db": -14.0,
+        }
+
+        # Dispositivos
+        self.mic_device: Optional[int] = None
+        self.system_device: Optional[int] = None
+
+        # Streams
+        self.mic_stream: Optional[sd.InputStream] = None
+        self.system_stream: Optional[sd.InputStream] = None
+
+        # Buffers e estatísticas
+        self.mic_frames: List[bytes] = []
+        self.system_audio_frames: List[bytes] = []
+        self.mic_timestamps: List[float] = []
+        self.system_timestamps: List[float] = []
+
+        # Filas para tempo real
+        self._mic_queue: Deque[bytes] = deque()
+        self._system_queue: Deque[bytes] = deque()
+
+        # Controle de concorrência
+        self.recording = False
+        self._lock = threading.Lock()
+        self._chunk_event = threading.Event()
+        self._stop_event = threading.Event()
+        self._chunk_thread: Optional[threading.Thread] = None
+        self._chunk_counter = 0
+        self.system_recording_thread: Optional[threading.Thread] = None
+
+        # Pastas e arquivos
+        self._data_dir = Path("data")
+        self._temp_dir = Path("temp")
+        self._config_path = Path("config/audio_config.json")
+
+        self._data_dir.mkdir(exist_ok=True)
+        self._temp_dir.mkdir(exist_ok=True)
+        self._config_path.parent.mkdir(exist_ok=True)
+
+        # Carregar configurações e detectar dispositivos
+        self._load_settings()
+        self._auto_detect_devices()
+
+    # ------------------------------------------------------------------
+    # Persistência e configuração
+    # ------------------------------------------------------------------
+    def _load_settings(self) -> None:
+        try:
+            if self._config_path.exists():
+                with open(self._config_path, "r", encoding="utf-8") as handle:
+                    payload = json.load(handle)
+                self.config.update(payload)
+                self.record_system_audio = payload.get("record_system_audio", self.record_system_audio)
+                self.chunk_duration = payload.get("chunk_duration", self.chunk_duration)
+                self.chunk_overlap = payload.get("chunk_overlap", self.chunk_overlap)
+            self.config.setdefault("noise_gate_hold_ms", 250.0)
+            self.config.setdefault("noise_gate_floor", 0.3)
+            if self.config.get("noise_gate_threshold_db", -65.0) > -62.0:
+                self.config["noise_gate_threshold_db"] = -65.0
+            if self.config.get("noise_gate_hold_ms", 250.0) < 200.0:
+                self.config["noise_gate_hold_ms"] = 250.0
+            if self.config.get("noise_gate_floor", 0.3) < 0.25:
+                self.config["noise_gate_floor"] = 0.3
+            if self.config.get("mic_gain_db", 0.0) < 7.0:
+                self.config["mic_gain_db"] = 7.5
+        except Exception as exc:
+            print(f"[AVISO] Não foi possível carregar configurações de áudio: {exc}")
+
+    def save_settings(self) -> None:
+        data = {
+            **self.config,
+            "record_system_audio": self.record_system_audio,
+            "chunk_duration": self.chunk_duration,
+            "chunk_overlap": self.chunk_overlap,
+        }
+        try:
+            with open(self._config_path, "w", encoding="utf-8") as handle:
+                json.dump(data, handle, indent=2)
+            print("[OK] Configurações de áudio salvas.")
+        except Exception as exc:
+            print(f"[ERRO] Falha ao salvar configurações de áudio: {exc}")
+
+    # ------------------------------------------------------------------
+    # API de compatibilidade com código legado
+    # ------------------------------------------------------------------
+    def set_input_device(self, device_index: Optional[int]) -> None:
+        self.mic_device = device_index
+
+    def set_record_system_audio(self, enable: bool) -> None:
+        self.record_system_audio = bool(enable)
+        if enable and self.system_device is None:
+            self._auto_detect_devices()
+
+    def set_realtime_transcription_callback(self, callback: Optional[RealtimeCallback]) -> None:
         self.realtime_callback = callback
-        
-    def get_default_device(self):
-        """Obter dispositivo de entrada padrão"""
+
+    def configure_audio(
+        self,
+        mic_gain_db: float = 6.0,
+        system_gain_db: float = 5.0,
+        enable_echo_reduction: bool = True,
+        echo_strength: float = 0.55,
+    ) -> None:
+        self.config["mic_gain_db"] = mic_gain_db
+        self.config["system_gain_db"] = system_gain_db
+        self.config["enable_echo_reduction"] = enable_echo_reduction
+        self.config["echo_strength"] = max(0.0, min(0.8, echo_strength))
+        self.save_settings()
+
+    def set_audio_gains(self, mic_gain: float = 1.0, system_gain: float = 1.0) -> None:
+        self.config["mic_gain_db"] = self.processor.linear_to_db(max(mic_gain, 1e-3))
+        self.config["system_gain_db"] = self.processor.linear_to_db(max(system_gain, 1e-3))
+        self.save_settings()
+
+    def set_echo_reduction(self, enable: bool, strength: float = 0.55) -> None:
+        self.config["enable_echo_reduction"] = enable
+        self.config["echo_strength"] = max(0.0, min(0.8, strength))
+        self.save_settings()
+
+    def get_audio_devices(self) -> List[dict]:
+        devices: List[dict] = []
         try:
-            default_device = self.audio.get_default_input_device_info()
-            return {
-                'index': default_device['index'],
-                'name': default_device['name'],
-                'channels': default_device['maxInputChannels']
-            }
-        except:
-            return None
-    
-    def start_recording(self):
-        """Iniciar gravação de áudio (microfone + sistema)"""
+            for index, device in enumerate(sd.query_devices()):
+                if int(device.get("max_input_channels", 0)) <= 0:
+                    continue
+                devices.append(
+                    {
+                        "index": index,
+                        "name": device.get("name", f"Dispositivo {index}"),
+                        "channels": device.get("max_input_channels", 0),
+                        "default_sample_rate": device.get("default_samplerate"),
+                    }
+                )
+        except Exception as exc:
+            print(f"[ERRO] Ao listar dispositivos: {exc}")
+        return devices
+
+    def get_system_audio_devices(self) -> List[dict]:
+        candidates: List[dict] = []
+        try:
+            for index, device in enumerate(sd.query_devices()):
+                if int(device.get("max_input_channels", 0)) <= 0:
+                    continue
+                name = str(device.get("name", "")).lower()
+                if any(keyword in name for keyword in SYSTEM_KEYWORDS):
+                    candidates.append(
+                        {
+                            "index": index,
+                            "name": device.get("name", f"Loopback {index}"),
+                            "channels": device.get("max_input_channels", 0),
+                            "default_sample_rate": device.get("default_samplerate"),
+                        }
+                    )
+        except Exception as exc:
+            print(f"[ERRO] Ao listar dispositivos de sistema: {exc}")
+        return candidates
+
+    def get_default_device(self) -> Optional[dict]:
+        try:
+            default = sd.query_devices(kind="input")
+            if default and isinstance(default, dict):
+                return {
+                    "index": default.get("index"),
+                    "name": default.get("name"),
+                    "channels": default.get("max_input_channels"),
+                }
+        except Exception:
+            pass
+        return None
+
+    @property
+    def rate(self) -> int:
+        return self.sample_rate
+
+    @rate.setter
+    def rate(self, value: int) -> None:
+        if value and value > 8000:
+            self.sample_rate = int(value)
+            self.save_settings()
+
+    # ------------------------------------------------------------------
+    # Detecção de dispositivos
+    # ------------------------------------------------------------------
+    def _auto_detect_devices(self) -> None:
+        try:
+            default_input = sd.query_devices(kind="input")
+            if default_input and isinstance(default_input, dict):
+                self.mic_device = default_input.get("index")
+                print(f"[MIC] Dispositivo padrão: {default_input.get('name')}")
+        except Exception as exc:
+            print(f"[AVISO] Falha ao detectar microfone padrão: {exc}")
+
+        try:
+            for idx, device in enumerate(sd.query_devices()):
+                if int(device.get("max_input_channels", 0)) == 0:
+                    continue
+                name = str(device.get("name", "")).lower()
+                if any(keyword in name for keyword in SYSTEM_KEYWORDS):
+                    self.system_device = idx
+                    print(f"[SYS] Dispositivo de sistema detectado: {device.get('name')}")
+                    break
+            else:
+                print("[AVISO] Nenhum dispositivo de áudio do sistema encontrado.")
+        except Exception as exc:
+            print(f"[ERRO] Falha ao detectar dispositivos: {exc}")
+
+    def set_devices(self, mic_device: Optional[int] = None, system_device: Optional[int] = None) -> None:
+        if mic_device is not None:
+            self.mic_device = mic_device
+        if system_device is not None:
+            self.system_device = system_device
+
+    # ------------------------------------------------------------------
+    # Captura principal
+    # ------------------------------------------------------------------
+    def start_recording(self) -> bool:
         if self.recording:
+            print("[AVISO] Gravação já está em andamento.")
             return False
-            
-        self.frames = []
-        self.mic_frames = []
-        self.system_audio_frames = []
-        self.mic_timestamps = []
-        self.system_timestamps = []
-        self.recording_start_time = time.time()
+
+        if self.mic_device is None:
+            print("[ERRO] Nenhum microfone configurado.")
+            return False
+
+        self._prepare_buffers()
+        self._stop_event.clear()
+        self._chunk_event.clear()
         self.recording = True
-        
+        self._chunk_counter = 0
+        self._start_time = time.time()
+
         try:
-            # 1. Iniciar gravação do microfone
-            success_mic = self._start_microphone_recording()
-            if not success_mic:
-                print("Falha ao iniciar gravação do microfone")
-                self.recording = False
-                return False
-            
-            # 2. Tentar iniciar gravação do áudio do sistema
-            if self.record_system_audio:
-                success_system = self._start_system_audio_recording()
-                if not success_system:
-                    print("Aviso: Não foi possível capturar áudio do sistema, gravando apenas microfone")
-            
-            print("Gravação iniciada - Microfone + Áudio do Sistema")
-            print("⚡ Configurações de baixa latência ativadas")
-            
-            # Iniciar thread de monitoramento de sincronização
-            self.sync_monitor_thread = threading.Thread(target=self._monitor_sync, daemon=True)
-            self.sync_monitor_thread.start()
-            
-            return True
-            
-        except Exception as e:
-            print(f"Erro ao iniciar gravação: {e}")
+            self.mic_stream = sd.InputStream(
+                samplerate=self.sample_rate,
+                channels=self.channels,
+                dtype="int16",
+                blocksize=self.chunk,
+                callback=self._mic_callback,
+                device=self.mic_device,
+                latency="low",
+            )
+            self.mic_stream.start()
+            print("[REC] Captura do microfone iniciada.")
+        except Exception as exc:
+            print(f"[ERRO] Falha ao iniciar microfone: {exc}")
             self.recording = False
             return False
-    
-    def _start_microphone_recording(self):
-        """Iniciar gravação do microfone"""
-        try:
-            # Tenta abrir com 2 canais, se falhar tenta 1 canal
+
+        if self.record_system_audio and self.system_device is not None:
             try:
-                self.mic_stream = self.audio.open(
-                    format=self.format,
+                self.system_stream = sd.InputStream(
+                    samplerate=self.sample_rate,
                     channels=self.channels,
-                    rate=self.rate,
-                    input=True,
-                    input_device_index=self.input_device_index,
-                    frames_per_buffer=self.chunk,
-                    stream_callback=self._mic_callback,
-                    # Configurações para reduzir latência
-                    input_host_api_specific_stream_info=None
+                    dtype="int16",
+                    blocksize=self.chunk,
+                    callback=self._system_callback,
+                    device=self.system_device,
+                    latency="low",
                 )
-            except Exception as e:
-                print(f"Tentando microfone com 1 canal devido ao erro: {e}")
-                self.channels = 1
-                self.mic_stream = self.audio.open(
-                    format=self.format,
-                    channels=self.channels,
-                    rate=self.rate,
-                    input=True,
-                    input_device_index=self.input_device_index,
-                    frames_per_buffer=self.chunk,
-                    stream_callback=self._mic_callback,
-                    # Configurações para reduzir latência
-                    input_host_api_specific_stream_info=None
-                )
-            
-            self.mic_stream.start_stream()
-            
-            # Mostrar qual dispositivo está sendo usado
-            if self.input_device_index is not None:
-                device_info = self.audio.get_device_info_by_index(self.input_device_index)
-                print(f"Microfone: {device_info['name']}")
-            else:
-                print("Microfone: Dispositivo padrão")
-                
-            return True
-            
-        except Exception as e:
-            print(f"Erro ao iniciar gravação do microfone: {e}")
-            return False
-    
-    def _start_system_audio_recording(self):
-        """Iniciar gravação do áudio do sistema usando sounddevice"""
-        try:
-            # Usar sounddevice para capturar áudio do sistema no Windows
-            # Procurar por dispositivo loopback ou stereo mix
-            loopback_device = self._find_loopback_device()
-            
-            if loopback_device is not None:
-                # Usar sounddevice em thread separada
-                self.system_recording_thread = threading.Thread(
-                    target=self._record_system_audio_thread,
-                    args=(loopback_device,)
-                )
-                self.system_recording_thread.daemon = True
-                self.system_recording_thread.start()
-                print(f"Áudio do sistema: Dispositivo {loopback_device}")
-                return True
-            else:
-                # Fallback: tentar capturar usando WASAPI via PyAudio
-                return self._start_system_audio_wasapi()
-                
-        except Exception as e:
-            print(f"Erro ao iniciar gravação do sistema: {e}")
-            return False
-    
-    def _find_loopback_device(self):
-        """Encontrar dispositivo de loopback no Windows"""
-        try:
-            devices = sd.query_devices()
-            
-            # Primeira prioridade: Mixagem estéreo (Stereo Mix em português)
-            for i, device in enumerate(devices):
-                device_name = str(device['name']).lower()
-                
-                if any(keyword in device_name for keyword in [
-                    'mixagem estéreo', 'mixagem estereo', 'mixagem estÃ©reo',
-                    'stereo mix', 'what u hear', 'wave out mix'
-                ]):
-                    if device['max_input_channels'] > 0:
-                        print(f"🎯 Encontrou Stereo Mix: {device['name']}")
-                        return i
-            
-            # Segunda prioridade: outros dispositivos de loopback
-            for i, device in enumerate(devices):
-                device_name = str(device['name']).lower()
-                
-                if any(keyword in device_name for keyword in [
-                    'sum', 'loopback'
-                ]):
-                    if device['max_input_channels'] > 0:
-                        print(f"🎯 Encontrou dispositivo loopback: {device['name']}")
-                        return i
-            
-            # Terceira prioridade: dispositivos que permitem entrada/saída
-            for i, device in enumerate(devices):
-                device_name = str(device['name']).lower()
-                
-                # Procurar por alto-falantes que também tenham entrada
-                if 'alto-falante' in device_name or 'speakers' in device_name:
-                    if device['max_input_channels'] > 0:
-                        print(f"🎯 Encontrou alto-falante com entrada: {device['name']}")
-                        return i
-                        
-            return None
-            
-        except Exception as e:
-            print(f"Erro ao procurar dispositivo de loopback: {e}")
-            return None
-    
-    def _record_system_audio_thread(self, device_index):
-        """Thread para gravar áudio do sistema usando sounddevice"""
-        try:
-            # Obter informações do dispositivo para determinar canais corretos
-            device_info = sd.query_devices(device_index)
-            available_channels = device_info['max_input_channels']
-            
-            # Usar o número correto de canais (preferir 2, mas aceitar 1)
-            channels = min(2, available_channels) if available_channels > 0 else 2
-            
-            # CORREÇÃO: Forçar usar a mesma taxa do microfone para evitar problemas de sync
-            device_rate = int(device_info['default_samplerate'])
-            sample_rate = self.rate  # Usar sempre a taxa do microfone (44100Hz)
-            
-            print(f"📡 Iniciando captura - Dispositivo: {device_info['name']}")
-            print(f"📡 Canais: {channels}, Taxa: {sample_rate} Hz (forçada de {device_rate} para sincronização)")
-            
-            frame_count = 0
-            
-            def callback(indata, frames, time, status):
-                nonlocal frame_count
-                if self.recording:
-                    try:
-                        # Debug: verificar se está recebendo dados
-                        frame_count += 1
-                        if frame_count % 50 == 0:  # Log a cada ~1 segundo
-                            volume = np.max(np.abs(indata)) if len(indata) > 0 else 0
-                            print(f"📊 Frame {frame_count}: Volume máximo = {volume:.4f}")
-                        
-                        # Sempre adicionar frame (mesmo se silêncio) para manter sincronização
-                        # Converter para o formato usado pelo PyAudio (int16)
-                        audio_data = (indata * 32767).astype(np.int16)
-                        
-                        # Se foi gravado em mono mas precisamos de estéreo, duplicar
-                        if audio_data.shape[1] == 1 and channels == 1:
-                            # Duplicar canal mono para estéreo
-                            audio_stereo = np.column_stack((audio_data[:, 0], audio_data[:, 0]))
-                            audio_data = audio_stereo
-                        
-                        self.system_audio_frames.append(audio_data.tobytes())
-                        
-                        # Registrar timestamp básico
-                        if hasattr(self, 'system_timestamps'):
-                            self.system_timestamps.append(time.time())
-                        
-                    except Exception:
-                        # Suprimir avisos de callback para evitar spam no terminal
-                        pass
-            
-            # Iniciar gravação com sounddevice
-            with sd.InputStream(
-                device=device_index,
-                channels=channels,
-                samplerate=sample_rate,
-                dtype=np.float32,
-                callback=callback,
-                blocksize=self.chunk,  # Usar chunk menor para menor latência
-                latency='low'  # Configurar para baixa latência
-            ):
-                print("🎙️ Gravação de áudio do sistema ativa!")
-                while self.recording:
-                    time.sleep(0.01)  # Reduzido para 10ms para melhor responsividade
-                    
-        except Exception as e:
-            print(f"❌ Erro na thread de gravação do sistema: {e}")
-            # Tentar fallback com PyAudio
-            self._fallback_pyaudio_system_recording(device_index)
-    
-    def _fallback_pyaudio_system_recording(self, device_index):
-        """Fallback: usar PyAudio diretamente para Stereo Mix"""
-        try:
-            print("🔄 Tentando fallback com PyAudio...")
-            
-            # Mapear índice do sounddevice para PyAudio (geralmente são iguais)
-            device_info = self.audio.get_device_info_by_index(device_index)
-            
-            if device_info['maxInputChannels'] > 0:
-                # Tentar com diferentes configurações de canal
-                for channels in [2, 1]:
-                    try:
-                        self.system_stream = self.audio.open(
-                            format=self.format,
-                            channels=channels,
-                            rate=self.rate,
-                            input=True,
-                            input_device_index=device_index,
-                            frames_per_buffer=self.chunk,
-                            stream_callback=self._system_callback,
-                            # Configurações para reduzir latência
-                            input_host_api_specific_stream_info=None
-                        )
-                        self.system_stream.start_stream()
-                        print(f"✅ Fallback PyAudio funcionou - {channels} canais")
-                        return True
-                        
-                    except Exception as e:
-                        print(f"Tentativa com {channels} canais falhou: {e}")
-                        continue
-                        
-        except Exception as e:
-            print(f"❌ Fallback PyAudio também falhou: {e}")
-            
-        return False
-    
-    def _start_system_audio_wasapi(self):
-        """Fallback: tentar WASAPI diretamente (método alternativo)"""
-        try:
-            # Procurar especificamente por Mixagem estéreo primeiro
-            for i in range(self.audio.get_device_count()):
-                device_info = self.audio.get_device_info_by_index(i)
-                device_name = device_info['name'].lower()
-                
-                # Primeira prioridade: Mixagem estéreo
-                if any(keyword in device_name for keyword in [
-                    'mixagem estéreo', 'mixagem estereo', 'mixagem estÃ©reo', 'stereo mix'
-                ]):
-                    if device_info['maxInputChannels'] > 0:
-                        return self._try_open_system_stream(i, device_info)
-            
-            # Segunda prioridade: outros dispositivos de sistema
-            for i in range(self.audio.get_device_count()):
-                device_info = self.audio.get_device_info_by_index(i)
-                device_name = device_info['name'].lower()
-                
-                if any(keyword in device_name for keyword in [
-                    'what u hear', 'wave out mix', 'sum', 'loopback'
-                ]):
-                    if device_info['maxInputChannels'] > 0:
-                        return self._try_open_system_stream(i, device_info)
-            
-            print("⚠️  Nenhum dispositivo de captura de áudio do sistema encontrado")
-            print("💡 Para capturar áudio do sistema no Windows:")
-            print("   1. Vá em Configurações de Som > Painel de Som")
-            print("   2. Aba 'Gravação' > Clique direito > 'Mostrar dispositivos desabilitados'")
-            print("   3. Habilite 'Stereo Mix' se disponível")
-            return False
-                
-        except Exception as e:
-            print(f"Erro no fallback WASAPI: {e}")
-            return False
-    
-    def _try_open_system_stream(self, device_index, device_info):
-        """Tentar abrir stream de sistema com diferentes configurações"""
-        for channels in [2, 1]:  # Tentar 2 canais primeiro, depois 1
-            if channels <= device_info['maxInputChannels']:
-                try:
-                    self.system_stream = self.audio.open(
-                        format=self.format,
-                        channels=channels,
-                        rate=self.rate,
-                        input=True,
-                        input_device_index=device_index,
-                        frames_per_buffer=self.chunk,
-                        stream_callback=self._system_callback
-                    )
-                    self.system_stream.start_stream()
-                    print(f"✅ Áudio do sistema via PyAudio: {device_info['name']} ({channels} canais)")
-                    return True
-                    
-                except Exception as e:
-                    print(f"❌ Falha {channels} canais em {device_info['name']}: {e}")
-                    continue
-                    
-        return False
-    
-    def _mic_callback(self, in_data, frame_count, time_info, status):
-        """Callback para captura do microfone"""
-        if self.recording:
-            self.mic_frames.append(in_data)
-            # Registrar timestamp básico
-            if hasattr(self, 'mic_timestamps'):
-                self.mic_timestamps.append(time.time())
-            
-            # Transcrição em tempo real DESABILITADA
-            # self._process_chunk_for_realtime_transcription()
-            
-            return (in_data, pyaudio.paContinue)
-        return (in_data, pyaudio.paComplete)
-    
-    def _system_callback(self, in_data, frame_count, time_info, status):
-        """Callback para captura do áudio do sistema"""
-        if self.recording:
-            self.system_audio_frames.append(in_data)
-            # Registrar timestamp básico
-            if hasattr(self, 'system_timestamps'):
-                self.system_timestamps.append(time.time())
-            return (in_data, pyaudio.paContinue)
-        return (in_data, pyaudio.paComplete)
-    
-    def stop_recording(self):
-        """Parar gravação e salvar arquivo mixado"""
+                self.system_stream.start()
+                print("[REC] Captura do áudio do sistema iniciada.")
+            except Exception as exc:
+                print(f"[AVISO] Falha ao iniciar captura do sistema: {exc}")
+                self.system_stream = None
+
+        if self.realtime_callback:
+            self._chunk_thread = threading.Thread(target=self._chunk_worker, daemon=True)
+            self._chunk_thread.start()
+
+        return True
+
+    def _prepare_buffers(self) -> None:
+        with self._lock:
+            self.mic_frames.clear()
+            self.system_audio_frames.clear()
+            self.mic_timestamps.clear()
+            self.system_timestamps.clear()
+            self._mic_queue.clear()
+            self._system_queue.clear()
+
+    def _mic_callback(self, indata, frames, time_info, status) -> None:
+        if status:
+            print(f"[AVISO] Callback do microfone reportou status: {status}")
+
         if not self.recording:
+            return
+
+        data_bytes = bytes(indata.copy().tobytes())
+        timestamp = time.time()
+
+        with self._lock:
+            self.mic_frames.append(data_bytes)
+            self._mic_queue.append(data_bytes)
+            self.mic_timestamps.append(timestamp)
+        self._chunk_event.set()
+
+    def _system_callback(self, indata, frames, time_info, status) -> None:
+        if status:
+            print(f"[AVISO] Callback do sistema reportou status: {status}")
+
+        if not self.recording:
+            return
+
+        data_bytes = bytes(indata.copy().tobytes())
+        timestamp = time.time()
+
+        with self._lock:
+            self.system_audio_frames.append(data_bytes)
+            self._system_queue.append(data_bytes)
+            self.system_timestamps.append(timestamp)
+        self._chunk_event.set()
+
+    def stop_recording(self) -> Optional[str]:
+        if not self.recording:
+            print("[AVISO] Nenhuma gravação ativa.")
             return None
-            
+
         self.recording = False
-        
-        # Parar streams do microfone
-        if self.mic_stream:
-            self.mic_stream.stop_stream()
-            self.mic_stream.close()
-            self.mic_stream = None
-            
-        # Parar stream do sistema (PyAudio)
-        if self.system_stream:
-            self.system_stream.stop_stream()
-            self.system_stream.close()
-            self.system_stream = None
-        
-        # Aguardar thread do sistema terminar
-        if self.system_recording_thread and self.system_recording_thread.is_alive():
-            self.system_recording_thread.join(timeout=2.0)
-            self.system_recording_thread = None
-        
-        # Aplicar sincronização se houver dados suficientes
-        if (hasattr(self, 'mic_timestamps') and hasattr(self, 'system_timestamps') and 
-            len(self.mic_timestamps) > 5 and len(self.system_timestamps) > 5):
-            print("🔄 Verificando sincronização de streams...")
-            
-            # Calcular estatísticas de sincronização
-            mic_avg = sum(self.mic_timestamps[-10:]) / min(10, len(self.mic_timestamps))
-            system_avg = sum(self.system_timestamps[-10:]) / min(10, len(self.system_timestamps))
-            time_diff = abs(mic_avg - system_avg)
-            
-            if time_diff > 0.1:
-                print(f"⚠️  Detectado atraso de {time_diff:.3f}s entre streams")
-            else:
-                print(f"✅ Sincronização boa: {time_diff:.3f}s")
-        
-        # Mixar áudio do microfone e sistema
-        filename = self._get_output_filename()
+        self._stop_event.set()
+        self._chunk_event.set()
+
+        self._cleanup_streams()
+
+        if self._chunk_thread and self._chunk_thread.is_alive():
+            self._chunk_thread.join(timeout=5.0)
+        self._chunk_thread = None
+
         try:
-            mixed_audio = self._mix_audio_sources()
-            
-            with wave.open(filename, 'wb') as wf:
-                wf.setnchannels(2)  # Sempre estéreo para o arquivo final
-                wf.setsampwidth(self.audio.get_sample_size(self.format))
-                wf.setframerate(self.rate)  # Usar taxa consistente (44100Hz)
-                wf.writeframes(mixed_audio)
-                
-            print(f"💾 Arquivo salvo: {self.rate}Hz, 2 canais, 16-bit")
-            
-            print(f"Áudio mixado salvo em: {filename}")
-            return filename
-            
-        except Exception as e:
-            print(f"Erro ao salvar áudio: {e}")
+            return self._render_final_file()
+        except Exception as exc:
+            print(f"[ERRO] Falha ao finalizar gravação: {exc}")
             return None
-    
-    def _mix_audio_sources(self):
-        """Mixar áudio do microfone e sistema"""
-        try:
-            # Converter frames para numpy arrays
-            mic_data = b''.join(self.mic_frames) if self.mic_frames else b''
-            system_data = b''.join(self.system_audio_frames) if self.system_audio_frames else b''
-            
-            if not mic_data and not system_data:
-                return b''
-            
-            # Se só tem microfone
-            if mic_data and not system_data:
-                print("Mixagem: Apenas microfone")
-                mic_array = np.frombuffer(mic_data, dtype=np.int16)
-                # Converter mono para estéreo se necessário
-                if self.channels == 1:
-                    mic_stereo = np.column_stack((mic_array, mic_array)).flatten()
+
+    def _cleanup_streams(self) -> None:
+        if self.mic_stream:
+            try:
+                self.mic_stream.stop()
+                self.mic_stream.close()
+            except Exception:
+                pass
+            self.mic_stream = None
+
+        if self.system_stream:
+            try:
+                self.system_stream.stop()
+                self.system_stream.close()
+            except Exception:
+                pass
+            self.system_stream = None
+
+    # ------------------------------------------------------------------
+    # Chunking e tempo real
+    # ------------------------------------------------------------------
+    def _chunk_worker(self) -> None:
+        chunk_samples = int(self.chunk_duration * self.sample_rate * self.channels)
+        step_seconds = max(self.chunk_duration - self.chunk_overlap, 1)
+        step_samples = int(step_seconds * self.sample_rate * self.channels)
+
+        mic_buffer = np.array([], dtype=np.int16)
+        system_buffer = np.array([], dtype=np.int16)
+
+        while True:
+            self._chunk_event.wait(timeout=0.5)
+            self._chunk_event.clear()
+
+            with self._lock:
+                mic_queue = self._drain_queue(self._mic_queue)
+                system_queue = self._drain_queue(self._system_queue)
+
+            if mic_queue.size:
+                mic_buffer = np.concatenate((mic_buffer, mic_queue))
+            if system_queue.size:
+                system_buffer = np.concatenate((system_buffer, system_queue))
+
+            should_continue = self.recording or mic_buffer.size >= chunk_samples
+            if not should_continue and self._stop_event.is_set():
+                if mic_buffer.size or system_buffer.size:
+                    self._emit_chunk(mic_buffer, system_buffer, final_chunk=True)
+                break
+
+            while mic_buffer.size >= chunk_samples:
+                mic_chunk = mic_buffer[:chunk_samples]
+                sys_chunk = system_buffer[:chunk_samples] if system_buffer.size >= chunk_samples else np.array([], dtype=np.int16)
+                self._emit_chunk(mic_chunk, sys_chunk)
+
+                mic_buffer = mic_buffer[step_samples:]
+                if system_buffer.size >= step_samples:
+                    system_buffer = system_buffer[step_samples:]
                 else:
-                    mic_stereo = mic_array
-                # Amplificar microfone usando configuração
-                mic_stereo = self._amplify_audio(mic_stereo, self.mic_gain)
-                print(f"🔊 Microfone amplificado: {self.mic_gain:.1f}x")
-                return mic_stereo.tobytes()
-            
-            # Se só tem áudio do sistema
-            if system_data and not mic_data:
-                print("Mixagem: Apenas áudio do sistema")
-                system_array = np.frombuffer(system_data, dtype=np.int16)
-                # Amplificar e normalizar áudio do sistema
-                system_array = self._amplify_audio(system_array, 2.0)
-                return system_array.tobytes()
-            
-            # Mixar ambos
-            print("Mixagem: Microfone + Áudio do sistema")
-            mic_array = np.frombuffer(mic_data, dtype=np.int16)
-            system_array = np.frombuffer(system_data, dtype=np.int16)
-            
-            # Como agora ambos usam a mesma taxa (44100Hz), não precisa resample
-            
-            # Ajustar tamanhos para o menor
-            min_length = min(len(mic_array), len(system_array))
-            mic_array = mic_array[:min_length]
-            system_array = system_array[:min_length]
-            
-            # Converter microfone para estéreo se necessário
-            if self.channels == 1 and len(mic_array) * 2 == len(system_array):
-                mic_array = np.repeat(mic_array, 2)
-            
-            # Garantir mesmo comprimento
-            if len(mic_array) != len(system_array):
-                min_length = min(len(mic_array), len(system_array))
-                mic_array = mic_array[:min_length]
-                system_array = system_array[:min_length]
-            
-            # Normalizar volumes individualmente antes de mixar
-            mic_normalized = self._normalize_audio(mic_array)
-            system_normalized = self._normalize_audio(system_array)
-            
-            # Aplicar redução de eco no áudio do sistema se habilitado
-            if self.enable_echo_reduction:
-                system_normalized = self._reduce_echo(system_normalized)
-            
-            # Mixar com volumes configuráveis - CORREÇÃO PARA EVITAR ESTOURO
-            mixed = (mic_normalized * self.mic_gain + system_normalized * self.system_gain).astype(np.int16)
-            
-            print(f"🔊 Volumes aplicados: Microfone={self.mic_gain:.1f}x, Sistema={self.system_gain:.1f}x")
-            
-            # Prevenir clipping
-            mixed = np.clip(mixed, -32767, 32767)
-            
-            return mixed.tobytes()
-            
-        except Exception as e:
-            print(f"Erro na mixagem: {e}")
-            import traceback
-            traceback.print_exc()
-            # Fallback: retornar apenas microfone
-            if self.mic_frames:
-                return b''.join(self.mic_frames)
-            return b''
-    
-    def _amplify_audio(self, audio_array, factor):
-        """Amplificar áudio por um fator"""
+                    system_buffer = np.array([], dtype=np.int16)
+
+    def _drain_queue(self, queue: Deque[bytes]) -> np.ndarray:
+        if not queue:
+            return np.array([], dtype=np.int16)
+        frames = []
+        while queue:
+            frames.append(np.frombuffer(queue.popleft(), dtype=np.int16))
+        return np.concatenate(frames) if frames else np.array([], dtype=np.int16)
+
+    def _emit_chunk(self, mic_chunk: np.ndarray, system_chunk: np.ndarray, final_chunk: bool = False) -> None:
+        if self.realtime_callback is None:
+            return
+
+        processed = self._process_pair(mic_chunk, system_chunk)
+        if processed.size == 0:
+            return
+
+        self._chunk_counter += 1
+        chunk_name = f"chunk_{self._chunk_counter:03d}.wav"
+        chunk_path = self._temp_dir / chunk_name
+        self._write_wav(chunk_path, processed)
+
         try:
-            amplified = audio_array * factor
-            # Prevenir clipping
-            amplified = np.clip(amplified, -32767, 32767)
-            return amplified.astype(np.int16)
-        except:
-            return audio_array
-    
-    def _normalize_audio(self, audio_array):
-        """Normalizar áudio para usar toda a faixa dinâmica sem estouro"""
-        try:
-            if len(audio_array) == 0:
-                return audio_array
-                
-            # Calcular RMS
-            rms = np.sqrt(np.mean(audio_array.astype(np.float32)**2))
-            
-            if rms > 0:
-                # Normalizar para ~50% da faixa máxima (mais conservador)
-                target_rms = 32767 * 0.5
-                factor = target_rms / rms
-                # Limitar amplificação máxima para evitar estouro
-                factor = min(factor, 2.0)
-                normalized = audio_array * factor
-                return np.clip(normalized, -32767, 32767).astype(np.int16)
-            
-            return audio_array
-            
-        except:
-            return audio_array
-    
-    def _reduce_echo(self, system_audio):
-        """Redução avançada de eco no áudio do sistema"""
-        try:
-            if len(system_audio) == 0:
-                return system_audio
-            
-            audio_float = system_audio.astype(np.float32)
-            
-            # 1. COMPRESSÃO DINÂMICA BASEADA NA INTENSIDADE
-            max_val = np.max(np.abs(audio_float))
-            
-            # Ajustar limiar baseado na intensidade
-            if self.echo_reduction_strength == "extreme":
-                threshold = 8000
-                reduction_factor = 0.25  # Muito agressivo
-            elif self.echo_reduction_strength == "aggressive":
-                threshold = 10000
-                reduction_factor = 0.3  # Agressivo (padrão para seu caso)
-            else:  # normal
-                threshold = 15000
-                reduction_factor = 0.4  # Suave
-                
-            if max_val > threshold:
-                compression_ratio = threshold / max_val
-                audio_float *= compression_ratio
-                print(f"🔧 Compressão {self.echo_reduction_strength}: {compression_ratio:.2f}")
-            
-            # 2. FILTRO PASSA-ALTA PARA REMOVER FREQUÊNCIAS BAIXAS (eco)
-            if len(audio_float) > 20:
-                # Filtro passa-alta simples - remove frequências baixas que causam eco
-                filtered = np.zeros_like(audio_float)
-                alpha = 0.95  # Coeficiente do filtro passa-alta
-                
-                filtered[0] = audio_float[0]
-                for i in range(1, len(audio_float)):
-                    filtered[i] = alpha * (filtered[i-1] + audio_float[i] - audio_float[i-1])
-                
-                audio_float = filtered
-            
-            # 3. REDUÇÃO DE REVERBERAÇÃO COM JANELA ADAPTATIVA
-            if len(audio_float) > 100:
-                window_size = min(50, len(audio_float) // 10)
-                smoothed = np.zeros_like(audio_float)
-                
-                for i in range(len(audio_float)):
-                    start = max(0, i - window_size)
-                    end = min(len(audio_float), i + window_size)
-                    
-                    # Média ponderada que reduz ecos
-                    window = audio_float[start:end]
-                    # Dar mais peso ao centro, menos às bordas (reduz eco)
-                    weights = np.ones(len(window))
-                    center = len(window) // 2
-                    
-                    for j in range(len(weights)):
-                        distance = abs(j - center)
-                        weights[j] = max(0.3, 1.0 - distance * 0.1)
-                    
-                    # Aplicar redução baseada na intensidade
-                    if self.echo_reduction_strength == "extreme":
-                        smoothed[i] = np.average(window, weights=weights) * 0.3 + audio_float[i] * 0.7
-                    elif self.echo_reduction_strength == "aggressive":
-                        smoothed[i] = np.average(window, weights=weights) * 0.5 + audio_float[i] * 0.5
-                    else:  # normal
-                        smoothed[i] = np.average(window, weights=weights) * 0.6 + audio_float[i] * 0.4
-                
-                audio_float = smoothed
-            
-            # 4. PROCESSAMENTO ESTÉREO PARA REDUZIR CORRELAÇÃO
-            if len(audio_float) % 2 == 0:  # Se é estéreo
-                left = audio_float[0::2]
-                right = audio_float[1::2]
-                
-                # Reduzir correlação entre canais
-                if len(left) > 10:
-                    # Aplicar pequeno atraso no canal direito
-                    right_delayed = np.roll(right, 2)
-                    right_delayed[:2] = right[:2]  # Manter início
-                    
-                    # Reduzir amplitude do canal mais forte
-                    left_rms = np.sqrt(np.mean(left**2))
-                    right_rms = np.sqrt(np.mean(right_delayed**2))
-                    
-                    if left_rms > right_rms * 1.2:
-                        left *= 0.85  # Reduzir canal esquerdo
-                    elif right_rms > left_rms * 1.2:
-                        right_delayed *= 0.85  # Reduzir canal direito
-                    
-                    # Recombinar canais
-                    result = np.zeros_like(audio_float)
-                    result[0::2] = left
-                    result[1::2] = right_delayed
-                    audio_float = result
-            
-            # 5. NORMALIZAÇÃO FINAL CONSERVADORA
-            max_final = np.max(np.abs(audio_float))
-            if max_final > 0:
-                # Normalizar para 60% da faixa dinâmica
-                target = 32767 * 0.6
-                if max_final > target:
-                    audio_float *= (target / max_final)
-            
-            return np.clip(audio_float, -32767, 32767).astype(np.int16)
-            
-        except Exception as e:
-            print(f"Erro na redução avançada de eco: {e}")
-            return system_audio
-            
-        except Exception as e:
-            print(f"Erro na normalização: {e}")
-            return system_audio
-    
-    def _resample_if_needed(self, audio_array, from_rate, to_rate):
-        """Resample áudio se as taxas forem diferentes"""
-        try:
-            if from_rate == to_rate or len(audio_array) == 0:
-                return audio_array
-            
-            # Resample simples usando interpolação linear
-            # Para uma solução mais precisa, usaria scipy.signal.resample
-            ratio = to_rate / from_rate
-            new_length = int(len(audio_array) * ratio)
-            
-            if new_length > 0:
-                # Interpolação linear simples
-                old_indices = np.linspace(0, len(audio_array) - 1, new_length)
-                resampled = np.interp(old_indices, np.arange(len(audio_array)), audio_array)
-                return resampled.astype(np.int16)
-            
-            return audio_array
-            
-        except Exception as e:
-            print(f"Erro no resample: {e}")
-            return audio_array
-    
-    def _synchronize_audio_streams(self, mic_data, system_data):
-        """Sincronizar streams de áudio baseado nos timestamps"""
-        try:
-            if not self.mic_timestamps or not self.system_timestamps:
-                return mic_data, system_data
-            
-            # Calcular diferença de tempo média entre os streams
-            mic_avg_time = sum(self.mic_timestamps) / len(self.mic_timestamps)
-            system_avg_time = sum(self.system_timestamps) / len(self.system_timestamps)
-            
-            time_diff = abs(mic_avg_time - system_avg_time)
-            
-            if time_diff > 0.05:  # Se diferença > 50ms, tentar corrigir
-                print(f"⚠️  Detectado atraso de {time_diff:.3f}s entre streams")
-                
-                # Se microfone está atrasado
-                if mic_avg_time > system_avg_time:
-                    # Calcular quantos samples remover do início do microfone
-                    samples_to_remove = int(time_diff * self.rate * self.channels)
-                    mic_array = np.frombuffer(mic_data, dtype=np.int16)
-                    if len(mic_array) > samples_to_remove:
-                        mic_array = mic_array[samples_to_remove:]
-                        mic_data = mic_array.tobytes()
-                        print(f"🔧 Cortou {samples_to_remove} samples do microfone")
-                
-                # Se sistema está atrasado
-                elif system_avg_time > mic_avg_time:
-                    # Calcular quantos samples remover do início do sistema
-                    samples_to_remove = int(time_diff * self.rate * 2)  # Sistema sempre 2 canais
-                    system_array = np.frombuffer(system_data, dtype=np.int16)
-                    if len(system_array) > samples_to_remove:
-                        system_array = system_array[samples_to_remove:]
-                        system_data = system_array.tobytes()
-                        print(f"🔧 Cortou {samples_to_remove} samples do sistema")
-            
-            return mic_data, system_data
-            
-        except Exception as e:
-            print(f"Erro na sincronização: {e}")
-            return mic_data, system_data
-    
-    def _monitor_sync(self):
-        """Monitorar sincronização durante a gravação"""
-        last_check = time.time()
-        
-        while self.recording:
-            time.sleep(1.0)  # Verificar a cada segundo
-            
-            if len(self.mic_timestamps) > 5 and len(self.system_timestamps) > 5:
-                # Pegar últimos 5 timestamps
-                recent_mic = self.mic_timestamps[-5:]
-                recent_system = self.system_timestamps[-5:]
-                
-                mic_avg = sum(recent_mic) / len(recent_mic)
-                system_avg = sum(recent_system) / len(recent_system)
-                
-                time_diff = abs(mic_avg - system_avg)
-                
-                if time_diff > 0.1:  # Se diferença > 100ms
-                    current_time = time.time()
-                    if current_time - last_check > 5.0:  # Alertar apenas a cada 5s
-                        print(f"⚠️  Atraso detectado: {time_diff:.3f}s entre streams")
-                        last_check = current_time
-    
-    def _get_output_filename(self):
-        """Gerar nome do arquivo de saída"""
+            self.realtime_callback(str(chunk_path), self._chunk_counter)
+        except Exception as exc:
+            print(f"[AVISO] Callback de chunk gerou exceção: {exc}")
+
+        if final_chunk:
+            self._chunk_event.set()
+
+    # ------------------------------------------------------------------
+    # Processamento e salvamento
+    # ------------------------------------------------------------------
+    def _process_pair(self, mic_audio: np.ndarray, system_audio: np.ndarray) -> np.ndarray:
+        mic_audio = mic_audio.astype(np.int16, copy=False)
+        system_audio = system_audio.astype(np.int16, copy=False)
+
+        if mic_audio.size:
+            mic_audio = self.processor.high_pass_filter(mic_audio, self.sample_rate)
+            mic_audio = self.processor.apply_gain(mic_audio, self.config.get("mic_gain_db", 0.0))
+            if self.config.get("enable_noise_gate", True):
+                mic_audio = self.processor.apply_noise_gate(
+                    mic_audio,
+                    sample_rate=self.sample_rate,
+                    threshold_db=self.config.get("noise_gate_threshold_db", -55.0),
+                    hold_ms=self.config.get("noise_gate_hold_ms", 120.0),
+                    floor=self.config.get("noise_gate_floor", 0.12),
+                )
+
+        if system_audio.size:
+            system_audio = self.processor.high_pass_filter(system_audio, self.sample_rate, cutoff=60.0)
+            system_audio = self.processor.apply_gain(system_audio, self.config.get("system_gain_db", 0.0))
+
+        if self.config.get("enable_echo_reduction", True) and mic_audio.size and system_audio.size:
+            system_audio = self.processor.reduce_echo(
+                system_audio,
+                mic_audio,
+                sample_rate=self.sample_rate,
+                strength=self.config.get("echo_strength", 0.55),
+            )
+
+        mixed = self.processor.mix_tracks(mic_audio, system_audio)
+
+        if self.config.get("enable_compressor", True):
+            mixed = self.processor.apply_compressor(
+                mixed,
+                threshold_db=self.config.get("compressor_threshold_db", -16.0),
+                ratio=self.config.get("compressor_ratio", 3.5),
+            )
+
+        mixed = self.processor.normalize(mixed, target_db=self.config.get("normalize_target_db", -14.0))
+        return mixed
+
+    def _render_final_file(self) -> str:
+        mic_audio = self._merge_bytes(self.mic_frames)
+        system_audio = self._merge_bytes(self.system_audio_frames)
+        final_audio = self._process_pair(mic_audio, system_audio)
+
+        if final_audio.size == 0:
+            raise RuntimeError("Nenhum áudio foi capturado.")
+
+        peak_db, rms_db = self.processor.analyze_levels(final_audio)
+        print(f"[ANÁLISE] Pico {peak_db:.1f} dBFS | RMS {rms_db:.1f} dBFS")
+
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        os.makedirs("data", exist_ok=True)
-        return f"data/recording_{timestamp}.wav"
-    
-    def get_audio_level(self):
-        """Obter nível de áudio atual (para indicador visual)"""
-        if not self.mic_frames and not self.system_audio_frames:
-            return 0
-        
-        try:
-            # Priorizar microfone para indicador visual
-            frames_to_check = self.mic_frames if self.mic_frames else self.system_audio_frames
-            
-            # Pegar os últimos frames
-            recent_frames = frames_to_check[-5:] if len(frames_to_check) >= 5 else frames_to_check
-            if not recent_frames:
-                return 0
-                
-            # Converter para numpy array e calcular RMS
-            audio_data = np.frombuffer(b''.join(recent_frames), dtype=np.int16)
-            rms = np.sqrt(np.mean(audio_data**2))
-            
-            # Normalizar para 0-100
-            return min(int((rms / 32767) * 100), 100)
-            
-        except Exception as e:
-            return 0
-    
-    def set_record_system_audio(self, enable):
-        """Habilitar/desabilitar gravação do áudio do sistema"""
-        self.record_system_audio = enable
-        print(f"Gravação de áudio do sistema: {'Habilitada' if enable else 'Desabilitada'}")
-    
-    def check_system_audio_capability(self):
-        """Verificar se é possível gravar áudio do sistema"""
-        try:
-            # Verificar usando sounddevice
-            loopback_device = self._find_loopback_device()
-            if loopback_device is not None:
-                return True, "Dispositivo de loopback encontrado"
-            
-            # Verificar usando PyAudio
-            for i in range(self.audio.get_device_count()):
-                device_info = self.audio.get_device_info_by_index(i)
-                device_name = device_info['name'].lower()
-                
-                if any(keyword in device_name for keyword in [
-                    'stereo mix', 'what u hear', 'wave out mix', 'sum'
-                ]):
-                    if device_info['maxInputChannels'] > 0:
-                        return True, f"Stereo Mix encontrado: {device_info['name']}"
-            
-            return False, "Nenhum dispositivo de captura de sistema encontrado"
-            
-        except Exception as e:
-            return False, f"Erro na verificação: {e}"
-    
-    def _process_chunk_for_realtime_transcription(self):
-        """Processar chunk de áudio para transcrição em tempo real - OTIMIZADO"""
-        if not self.realtime_callback or not self.recording:
-            return
-            
-        current_time = time.time()
-        if current_time - self.last_chunk_time < self.chunk_duration:
-            return
-            
-        try:
-            # Criar chunk temporário com os dados atuais
-            self.chunk_counter += 1
-            chunk_filename = f"{self.temp_dir}/realtime_chunk_{self.chunk_counter}.wav"
-            
-            # Mixar áudio atual (otimizado)
-            mixed_audio = self._mix_audio_sources_fast()
-            if not mixed_audio:
-                return
-                
-            # Salvar chunk temporário (compressão otimizada)
-            with wave.open(chunk_filename, 'wb') as wf:
-                wf.setnchannels(self.channels)
-                wf.setsampwidth(self.audio.get_sample_size(self.format))
-                wf.setframerate(self.rate)
-                wf.writeframes(mixed_audio)
-            
-            # Chamar callback para transcrição em thread separada (prioridade alta)
-            def transcribe_chunk():
-                try:
-                    if self.realtime_callback:
-                        self.realtime_callback(chunk_filename, self.chunk_counter)
-                except Exception as e:
-                    print(f"Erro na transcrição em tempo real: {e}")
-                finally:
-                    # Remover arquivo temporário
-                    try:
-                        if os.path.exists(chunk_filename):
-                            os.remove(chunk_filename)
-                    except:
-                        pass
-            
-            threading.Thread(target=transcribe_chunk, daemon=True).start()
-            self.last_chunk_time = current_time
-            
-            # Limpar frames antigas para liberar memória (manter últimos 2 chunks)
-            frames_per_chunk = int(self.rate * self.chunk_duration / self.chunk)
-            if len(self.mic_frames) > frames_per_chunk * 2:
-                self.mic_frames = self.mic_frames[-frames_per_chunk:]
-            if len(self.system_audio_frames) > frames_per_chunk * 2:
-                self.system_audio_frames = self.system_audio_frames[-frames_per_chunk:]
-                
-        except Exception as e:
-            print(f"Erro ao processar chunk para transcrição: {e}")
+        output_path = self._data_dir / f"recording_{timestamp}.wav"
+        self._write_wav(output_path, final_audio)
+        print(f"[OK] Arquivo salvo em {output_path}")
+        return str(output_path)
 
-    def _mix_audio_sources_fast(self):
-        """Mixagem otimizada para transcrição em tempo real com sobreposição inteligente"""
-        try:
-            # Usar frames com sobreposição de 2 segundos para garantir continuidade
-            overlap_duration = 2  # segundos de sobreposição
-            total_duration = self.chunk_duration + overlap_duration
-            frames_needed = int(self.rate * total_duration / self.chunk)
-            
-            # Pegar frames com contexto substancial para não perder palavras
-            mic_data = b''.join(self.mic_frames[-frames_needed:]) if self.mic_frames else b''
-            system_data = b''.join(self.system_audio_frames[-frames_needed:]) if self.system_audio_frames else b''
-            
-            if not mic_data and not system_data:
-                return b''
-            
-            # Processamento simplificado para velocidade
-            if mic_data and not system_data:
-                mic_array = np.frombuffer(mic_data, dtype=np.int16)
-                if self.channels == 2 and len(mic_array) % 2 != 0:
-                    mic_array = mic_array[:-1]  # Garantir número par para estéreo
-                return self._amplify_audio(mic_array, 3.0).tobytes()
-            
-            if system_data and not mic_data:
-                system_array = np.frombuffer(system_data, dtype=np.int16)
-                return self._amplify_audio(system_array, 1.5).tobytes()
-            
-            # Mixagem rápida de ambos
-            mic_array = np.frombuffer(mic_data, dtype=np.int16)
-            system_array = np.frombuffer(system_data, dtype=np.int16)
-            
-            # Ajustar para mesmo tamanho rapidamente
-            min_length = min(len(mic_array), len(system_array))
-            mic_array = mic_array[:min_length]
-            system_array = system_array[:min_length]
-            
-            # Mixagem simples com amplificação configurável
-            mic_amplified = self._amplify_audio(mic_array, self.mic_gain)
-            system_amplified = self._amplify_audio(system_array, self.system_gain)
-            
-            # Combinação sem overflow checking para velocidade
-            mixed = (mic_amplified.astype(np.int32) + system_amplified.astype(np.int32))
-            mixed = np.clip(mixed, -32768, 32767).astype(np.int16)
-            
-            return mixed.tobytes()
-            
-        except Exception as e:
-            print(f"Erro na mixagem rápida: {e}")
-            # Fallback para mixagem normal
-            return self._mix_audio_sources()
+    def _merge_bytes(self, frames: List[bytes]) -> np.ndarray:
+        if not frames:
+            return np.array([], dtype=np.int16)
+        data = b"".join(frames)
+        return np.frombuffer(data, dtype=np.int16)
 
-    def get_system_audio_setup_instructions(self):
-        """Retornar instruções para configurar captura de áudio do sistema"""
-        return """
-        Para habilitar a captura de áudio do sistema no Windows:
-        
-        1. Clique direito no ícone de som na barra de tarefas
-        2. Selecione 'Configurações de som'
-        3. Role para baixo e clique em 'Painel de som'
-        4. Vá para a aba 'Gravação'
-        5. Clique direito no espaço vazio e marque:
-           ☑ Mostrar dispositivos desabilitados
-           ☑ Mostrar dispositivos desconectados
-        6. Se aparecer 'Stereo Mix', clique direito nele e selecione 'Habilitar'
-        7. Defina como dispositivo padrão se necessário
-        
-        Nota: Nem todas as placas de som suportam Stereo Mix.
-        Como alternativa, use cabos de áudio ou software de terceiros.
-        """
-    
+    def _write_wav(self, path: Path, audio: np.ndarray) -> None:
+        if audio.size == 0:
+            return
+
+        remainder = audio.size % self.channels
+        if remainder:
+            audio = audio[:-remainder]
+
+        stereo = audio.reshape(-1, self.channels)
+
+        with wave.open(str(path), "wb") as wf:
+            wf.setnchannels(self.channels)
+            wf.setsampwidth(2)
+            wf.setframerate(self.sample_rate)
+            wf.writeframes(stereo.astype(np.int16).tobytes())
+
+    # ------------------------------------------------------------------
+    # Diagnósticos e utilidades
+    # ------------------------------------------------------------------
+    def diagnose_audio_issues(self, filename: Optional[str] = None) -> None:
+        print("\n=== DIAGNÓSTICO DE ÁUDIO ===")
+        print(f"Sample rate: {self.sample_rate} Hz | Canais: {self.channels}")
+        print(f"Ganho Mic: {self.config['mic_gain_db']:+.1f} dB | Ganho Sistema: {self.config['system_gain_db']:+.1f} dB")
+        print(f"Normalização alvo: {self.config['normalize_target_db']:.1f} dBFS")
+        print(f"Redução de eco: {'Ativa' if self.config.get('enable_echo_reduction', True) else 'Inativa'}")
+        print(f"Noise gate: {'Ativo' if self.config.get('enable_noise_gate', True) else 'Inativo'}")
+
+        if filename:
+            try:
+                with wave.open(filename, "rb") as wf:
+                    frames = wf.readframes(wf.getnframes())
+                audio = np.frombuffer(frames, dtype=np.int16)
+                peak_db, rms_db = self.processor.analyze_levels(audio)
+                print(f"[Arquivo] {filename}")
+                print(f"          Pico {peak_db:.1f} dBFS | RMS {rms_db:.1f} dBFS")
+            except Exception as exc:
+                print(f"[ERRO] Não foi possível analisar {filename}: {exc}")
+
+        print("=== FIM DO DIAGNÓSTICO ===\n")
+
+    def check_system_audio_capability(self) -> Tuple[bool, str]:
+        devices = self.get_system_audio_devices()
+        if not devices:
+            message = (
+                "Nenhum dispositivo de loopback encontrado. Habilite o 'Stereo Mix' ou recurso equivalente "
+                "nas configurações de som."
+            )
+            return False, message
+        return True, f"{len(devices)} dispositivo(s) de áudio do sistema disponíveis."
+
+    def get_system_audio_setup_instructions(self) -> str:
+        return (
+            "Como habilitar a captura do áudio do sistema (Windows):\n"
+            "1. Clique com o botão direito no ícone de som e selecione 'Sons'.\n"
+            "2. Abra a aba 'Gravação'.\n"
+            "3. Habilite 'Mostrar dispositivos desativados'.\n"
+            "4. Ative 'Mixagem Estéreo' e defina como dispositivo padrão.\n"
+            "5. Volte ao MeetAI e selecione o dispositivo na lista.\n"
+        )
+
+    def get_audio_level(self) -> int:
+        with self._lock:
+            recent = self.mic_frames[-5:] if self.mic_frames else []
+        if not recent:
+            return 0
+        audio = np.frombuffer(b"".join(recent), dtype=np.int16)
+        if audio.size == 0:
+            return 0
+        rms = np.sqrt(np.mean(audio.astype(np.float64) ** 2))
+        level = int((rms / 32767.0) * 100 * 2.5)
+        return max(0, min(100, level))
+
+    # ------------------------------------------------------------------
+    # Operações adicionais / compatibilidade
+    # ------------------------------------------------------------------
+    def _start_system_audio_recording(self) -> bool:
+        if self.system_device is None:
+            return False
+
+        self._prepare_buffers()
+        self._stop_event.clear()
+        self.record_system_audio = True
+        self.recording = True
+
+        try:
+            self.system_stream = sd.InputStream(
+                samplerate=self.sample_rate,
+                channels=self.channels,
+                dtype="int16",
+                blocksize=self.chunk,
+                callback=self._system_callback,
+                device=self.system_device,
+                latency="low",
+            )
+            self.system_stream.start()
+            print("[REC] Captura somente do áudio do sistema iniciada.")
+            return True
+        except Exception as exc:
+            print(f"[ERRO] Falha ao iniciar captura do sistema: {exc}")
+            self.system_stream = None
+            self.recording = False
+            return False
+
+    def quick_setup_for_meetings(self) -> None:
+        self.configure_audio(mic_gain_db=6.5, system_gain_db=6.0, enable_echo_reduction=True, echo_strength=0.5)
+        self.config["noise_gate_threshold_db"] = -60.0
+
+    def quick_setup_for_presentations(self) -> None:
+        self.configure_audio(mic_gain_db=4.5, system_gain_db=6.5, enable_echo_reduction=True, echo_strength=0.45)
+        self.config["noise_gate_threshold_db"] = -55.0
+
+    def quick_setup_low_noise(self) -> None:
+        self.configure_audio(mic_gain_db=8.0, system_gain_db=5.0, enable_echo_reduction=True, echo_strength=0.35)
+        self.config["noise_gate_threshold_db"] = -60.0
+
     def __del__(self):
-        """Cleanup"""
-        if hasattr(self, 'audio'):
-            self.audio.terminate()
+        try:
+            self._cleanup_streams()
+        except Exception:
+            pass
+
+
+def get_audio_devices() -> List[dict]:
+    """Compatibilidade com importações antigas."""
+    return AudioRecorder().get_audio_devices()
+
+
+def get_system_audio_devices() -> List[dict]:
+    """Compatibilidade com importações antigas."""
+    return AudioRecorder().get_system_audio_devices()

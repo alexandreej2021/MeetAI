@@ -61,7 +61,10 @@ class MeetAI:
                     
                     # Configurar dispositivo de entrada
                     input_device = audio_config.get('input_device')
-                    self.audio_recorder.set_input_device(input_device)
+                    if input_device is not None:
+                        self.audio_recorder.set_input_device(input_device)
+                    else:
+                        print("Dispositivo de microfone nao definido nas configuracoes; usando auto-detectado.")
                     
                     # Configurar sample rate
                     sample_rate = audio_config.get('sample_rate', 44100)
@@ -71,7 +74,8 @@ class MeetAI:
                     record_system = audio_config.get('record_system_audio', True)
                     self.audio_recorder.set_record_system_audio(record_system)
                     
-                    print(f"Configurações de áudio carregadas: Dispositivo={input_device}, Sample Rate={sample_rate}, Sistema={record_system}")
+                    device_label = input_device if input_device is not None else "Auto"
+                    print(f"Configurações de áudio carregadas: Dispositivo={device_label}, Sample Rate={sample_rate}, Sistema={record_system}")
         except Exception as e:
             print(f"Erro ao carregar configurações de áudio: {e}")
     

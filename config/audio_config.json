@@ -1,0 +1,20 @@
+{
+  "mic_gain_db": 7.5,
+  "system_gain_db": 6.0,
+  "enable_echo_reduction": true,
+  "echo_strength": 0.55,
+  "enable_noise_gate": true,
+  "noise_gate_threshold_db": -65.0,
+  "noise_gate_hold_ms": 250.0,
+  "noise_gate_floor": 0.3,
+  "enable_compressor": true,
+  "compressor_threshold_db": -16.0,
+  "compressor_ratio": 3.5,
+  "normalize_target_db": -14.0,
+  "echo_reduction_strength": 0.3,
+  "normalize_output": true,
+  "target_volume_db": -15.0,
+  "record_system_audio": true,
+  "chunk_duration": 8,
+  "chunk_overlap": 2
+}
