@@ -1,0 +1,4 @@
+{
+  "name": "Auto",
+  "prompt": "Escolha o melhor formato de resumo automaticamente baseado no conteúdo. Analise esta transcrição e crie um resumo estruturado usando o formato mais adequado:\n\n• **Para reuniões**: Use formato de ata com participantes, decisões e ações\n• **Para apresentações**: Foque em pontos principais e conclusões\n• **Para conversas**: Destaque temas e insights importantes\n• **Para treinamentos**: Organize por tópicos e aprendizados\n\nEscolha automaticamente a estrutura que melhor se adapta ao conteúdo e crie um resumo claro e útil."
+}

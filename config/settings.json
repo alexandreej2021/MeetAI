@@ -1,0 +1,25 @@
+{
+  "audio": {
+    "sample_rate": 44100,
+    "channels": 2,
+    "chunk_size": 1024,
+    "input_device": null,
+    "record_system_audio": true
+  },
+  "ai": {
+    "model": "gpt-3.5-turbo",
+    "max_tokens": 1500,
+    "temperature": 0.3,
+    "language": "pt"
+  },
+  "ui": {
+    "theme": "clam",
+    "window_size": "900x700",
+    "auto_save": false
+  },
+  "output": {
+    "format": "txt",
+    "directory": "outputs",
+    "include_timestamp": true
+  }
+}

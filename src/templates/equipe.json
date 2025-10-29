@@ -1,0 +1,4 @@
+{
+  "name": "Reunião de equipe",
+  "prompt": "Resuma esta reunião de equipe com foco em:\n\n1. **Participantes**: Membros da equipe presentes\n2. **Objetivo**: Propósito principal da reunião\n3. **Atualizações**: Status dos projetos e atividades\n4. **Decisões**: Resoluções tomadas pela equipe\n5. **Itens de ação**: Tarefas definidas e responsáveis\n6. **Prazos**: Deadlines e marcos importantes\n7. **Próximos passos**: Planejamento futuro\n\nDestaque decisões importantes e responsabilidades atribuídas."
+}

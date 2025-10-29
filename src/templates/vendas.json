@@ -1,0 +1,4 @@
+{
+  "name": "Chamada de vendas",
+  "prompt": "Organize esta chamada de vendas focando em:\n\n1. **Cliente/Prospect**: Informações sobre o cliente prospectado\n2. **Necessidades**: Demandas e dores identificadas\n3. **Soluções Apresentadas**: Produtos/serviços oferecidos\n4. **Objeções**: Resistências ou dúvidas do cliente\n5. **Respostas**: Como as objeções foram tratadas\n6. **Próximos Passos**: Follow-up e ações acordadas\n7. **Status da Oportunidade**: Estágio atual da venda\n\nFoque em insights sobre clientes, demandas e acompanhamento."
+}

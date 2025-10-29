@@ -1,0 +1,4 @@
+{
+  "name": "Standup",
+  "prompt": "Organize este standup/daily seguindo o formato ágil:\n\n1. **Participantes**: Quem esteve presente na reunião\n2. **O que foi feito**: Progresso desde o último standup\n3. **O que será feito**: Próximas tarefas e objetivos\n4. **Bloqueios**: Impedimentos ou dificuldades identificadas\n5. **Itens de ação**: Ações específicas definidas\n6. **Observações**: Comentários importantes da equipe\n\nMantenha foco em progresso, bloqueios e itens de ação."
+}
